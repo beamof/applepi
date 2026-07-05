@@ -16,6 +16,9 @@ pub struct Config {
     /// MCP 服务器列表（Streamable HTTP 传输）。默认空。
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Cron 定时任务（仅 bot 模式生效）。默认禁用。
+    #[serde(default)]
+    pub cron: CronSection,
 }
 
 #[derive(Deserialize, Clone)]
@@ -75,6 +78,41 @@ pub struct McpServerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_cron_db() -> String {
+    "data/cron.db".into()
+}
+
+/// Cron 定时任务配置（仅 bot 模式生效）。
+#[derive(Deserialize, Clone, Default)]
+pub struct CronSection {
+    /// 总开关，默认 false。
+    #[serde(default)]
+    pub enabled: bool,
+    /// SQLite 路径，默认 data/cron.db（与长期记忆库分库）。
+    #[serde(default = "default_cron_db")]
+    pub db_path: String,
+    /// 启动时种子 job：首次启动按 name 去重写入 DB；已存在不重复插入。
+    /// 之后所有增删改通过 /cron 命令操作 DB，这里改动不再生效。
+    #[serde(default)]
+    pub jobs: Vec<CronJob>,
+}
+
+/// 单个 Cron 定时任务（配置种子形态，无 id 字段）。
+#[derive(Deserialize, Clone)]
+pub struct CronJob {
+    /// 名称，用于日志标识与种子去重。
+    pub name: String,
+    /// 标准 cron 表达式（北京时间），如 "0 9 * * *"。支持 5 字段（分 时 日 月 周）。
+    pub schedule: String,
+    /// 触发时发给 agent 的 prompt。
+    pub prompt: String,
+    /// 推送目标 Telegram chat_id。
+    pub chat_id: i64,
+    /// 是否启用，默认 true。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 pub fn load(path: &str) -> Result<Config> {

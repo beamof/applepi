@@ -99,6 +99,10 @@ applepi/
     │   ├── mod.rs          # 加载入口 + 工具合并
     │   ├── client.rs       # Streamable HTTP JSON-RPC 客户端
     │   └── tool.rs         # 远端工具 → 本地 Tool 适配器
+    ├── cron/               # ★ 定时任务（仅 bot 模式）
+    │   ├── mod.rs          # scheduler：cron 触发 + 独立 Agent 推送
+    │   ├── store.rs        # SQLite 持久化
+    │   └── commands.rs     # /cron 命令解析
     ├── tools/
     │   ├── mod.rs          # Tool trait + 注册表（扩展点）
     │   ├── echo.rs         # 示例工具
@@ -169,6 +173,45 @@ mcp_servers:
 - **连接共享**：同一服务器的多个工具共享一个连接，避免重复握手。
 - **工具名冲突**：同名工具后者覆盖前者（HashMap 语义），覆盖时打印警告。
 
+### 定时任务 Cron（`cron/`，仅 bot 模式）
+
+按 cron 表达式定时触发 Agent 执行预设 prompt，把回复推送到指定 Telegram chat_id。适合每日总结、定时提醒、周期巡检等场景。
+
+**配置**（`config.yaml`）：
+
+```yaml
+cron:
+  enabled: true                  # 总开关
+  db_path: data/cron.db          # 持久化库（与长期记忆库分库）
+  jobs:                          # 启动时种子 job（首次写入 DB，之后由 /cron 命令管理）
+    - name: daily_summary
+      schedule: "0 9 * * *"      # 北京时间每天 9:00
+      prompt: "总结今天的待办"
+      chat_id: 123456789
+      enabled: true
+```
+
+**运行时管理**（在 Telegram 里直接发命令）：
+
+| 命令 | 作用 |
+|---|---|
+| `/cron list` | 列出所有任务 |
+| `/cron add <name> "<cron>" <chat_id> <prompt...>` | 新增任务 |
+| `/cron del <id>` | 删除任务 |
+| `/cron pause <id>` | 暂停任务 |
+| `/cron resume <id>` | 恢复任务 |
+| `/cron help` | 帮助 |
+
+示例：`/cron add 早报 "0 9 * * *" 123456 给出今日待办`
+
+**设计要点：**
+
+- **持久化**：任务存 `data/cron.db`，重启不丢失。`config.yaml` 的 `jobs` 仅作为首次启动的种子。
+- **时区**：cron 表达式按**北京时间（UTC+8）**解释。
+- **错过不补**：进程停机期间错过的任务跳过，重启后从下次匹配时间继续。
+- **独立 Agent**：每个任务一个独立 Agent，不与 bot 的对话 Agent 共享状态/锁。
+- **热重载**：`/cron` 命令改动后通过 watch 通道立即生效，无需重启进程。
+
 ### ReAct 主循环（`agent.rs`）
 
 ```
@@ -212,6 +255,9 @@ mcp_servers:
 | `memory.top_k` | 注入记忆条数 | `3` |
 | `telegram.bot_token` | Telegram token | 留空则读环境变量 |
 | `mcp_servers` | MCP 服务器列表（HTTP/SSE） | `[]`（不接入） |
+| `cron.enabled` | 是否启用定时任务 | `false` |
+| `cron.db_path` | Cron 持久化库路径 | `data/cron.db` |
+| `cron.jobs` | 种子任务列表（首次写入 DB） | `[]`（无） |
 
 ---
 

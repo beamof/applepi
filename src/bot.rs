@@ -67,6 +67,27 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     // 这里为简化，每个 agent 重新 open 一份（SQLite 多连接没问题）。
     drop(long_term);
 
+    // Cron scheduler：仅当启用时启动。watch 通道用于 /cron 命令改动后通知重载。
+    let (reload_tx, reload_rx) = tokio::sync::watch::channel(());
+    let mut cron_store: Option<Arc<crate::cron::store::CronStore>> = None;
+    if cfg.cron.enabled {
+        match crate::cron::store::CronStore::open(&cfg.cron.db_path) {
+            Ok(s) => {
+                cron_store = Some(Arc::new(s));
+                let n = cfg.cron.jobs.len();
+                tracing::info!("Cron 已启用（{} 个种子任务待写入）", n);
+                tokio::spawn(crate::cron::run(
+                    cfg.clone(),
+                    api_key.clone(),
+                    http.clone(),
+                    base.clone(),
+                    reload_rx,
+                ));
+            }
+            Err(e) => tracing::error!("Cron DB 打开失败，scheduler 未启动: {e}"),
+        }
+    }
+
     let mut offset: Option<i64> = None;
     tracing::info!("Telegram bot 已启动，开始长轮询...");
 
@@ -102,6 +123,22 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             let Some(text) = msg.text else { continue };
             let chat_id = msg.chat.id;
             if text.trim().is_empty() {
+                continue;
+            }
+
+            // /cron 命令分发（不走 agent）
+            if text.trim_start().starts_with("/cron") {
+                let reply = match &cron_store {
+                    Some(store) => {
+                        crate::cron::commands::handle(&text, store, &reload_tx).await
+                    }
+                    None => "Cron 未启用（config.yaml 的 cron.enabled = false）。".into(),
+                };
+                let _ = http
+                    .post(format!("{base}/sendMessage"))
+                    .json(&json!({ "chat_id": chat_id, "text": reply }))
+                    .send()
+                    .await;
                 continue;
             }
 

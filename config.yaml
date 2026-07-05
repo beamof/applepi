@@ -9,7 +9,7 @@ llm:
   # DeepSeek: https://api.deepseek.com/v1        model: deepseek-chat
   # 智谱:     https://open.bigmodel.cn/api/paas/v4 model: glm-4-flash
   # 本地:     http://localhost:11434/v1           model: qwen2.5
-  api_base: https://llm.notok.cn/v1
+  api_base: https://chat.openai.com/v1
   model: gemini-3-flash-agent
   # API Key：留空则回退到环境变量 OPENAI_API_KEY（或 API_KEY）
   api_key: ""

@@ -1,0 +1,29 @@
+agent:
+  persona: |
+    你是 applepi，一个简洁高效的个人 AI 助手。
+    回答简短直接，遇到需要外部信息或本地文件时优先调用工具。
+    你拥有长期记忆，会记住用户告诉你的事实。
+
+llm:
+  # OpenAI 兼容接口。换厂商只需改这里：
+  # DeepSeek: https://api.deepseek.com/v1        model: deepseek-chat
+  # 智谱:     https://open.bigmodel.cn/api/paas/v4 model: glm-4-flash
+  # 本地:     http://localhost:11434/v1           model: qwen2.5
+  api_base: https://llm.notok.cn/v1
+  model: gemini-3-flash-agent
+  # API Key：留空则回退到环境变量 OPENAI_API_KEY（或 API_KEY）
+  api_key: ""
+
+embeddings:
+  # 向量模型，用于长期记忆检索。本地可换成 bge-m3 等
+  model: text-embedding-3-small
+  # api_base: 留空则复用 llm.api_base
+
+memory:
+  enabled: true
+  db_path: data/applepi.db
+  top_k: 3 # 每次对话注入的最多相关记忆数
+
+telegram:
+  # bot_token 留空则从环境变量 TELEGRAM_BOT_TOKEN 读取
+  bot_token: ""

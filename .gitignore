@@ -1,0 +1,10 @@
+# Rust
+/target
+debug/
+*.pdb
+
+# 本地密钥（含真实 key/token，绝不提交）
+.env
+
+# 运行时数据（用户记忆库）
+/data

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
-    pub agent: AgentSection,
     pub llm: LlmSection,
     #[serde(default)]
     pub embeddings: EmbeddingsSection,
@@ -19,11 +18,6 @@ pub struct Config {
     /// Cron 定时任务（仅 bot 模式生效）。默认禁用。
     #[serde(default)]
     pub cron: CronSection,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct AgentSection {
-    pub persona: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -118,6 +112,18 @@ pub struct CronJob {
 pub fn load(path: &str) -> Result<Config> {
     let raw = std::fs::read_to_string(path)?;
     Ok(serde_yaml::from_str(&raw)?)
+}
+
+/// 从 AGENTS.md 读取人设（启动时读一次）。
+/// 文件不存在时报错并提示创建。
+pub fn load_persona(path: &str) -> Result<String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "读取人设文件 {path} 失败: {e}\n\
+             请在项目根目录创建 AGENTS.md 描述助手人设。"
+        )
+    })?;
+    Ok(raw.trim().to_string())
 }
 
 impl Config {

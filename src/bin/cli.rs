@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::load("config.yaml")?;
     let api_key = cfg.resolve_api_key()?;
+    let persona = config::load_persona("AGENTS.md")?;
 
     let long_term = if cfg.memory.enabled {
         Some(LongTermMemory::open(&cfg.memory.db_path, cfg.embeddings_config(api_key.clone()))?)
@@ -29,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut agent = Agent::new(
         cfg.llm_config(api_key),
-        cfg.agent.persona,
+        persona,
         tools,
         long_term,
         cfg.memory.top_k_or(3),

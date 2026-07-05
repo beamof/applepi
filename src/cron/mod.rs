@@ -3,13 +3,12 @@
 //! 设计：
 //! - job 存 SQLite（`data/cron.db`），重启不丢失。
 //! - 每个 enabled job 一个独立常驻任务，构造专用 Agent，不碰 bot 的 agents 锁。
-//! - 重载机制：bot 主循环里 /cron 命令改动 DB 后，通过 watch 通道发信号；
+//! - 重载机制：agent 通过 `cron` 工具改动 DB 后，经 watch 通道发信号；
 //!   scheduler 收到后 abort 全部任务、重新拉起所有当前 enabled job。
 //! - 时区：cron 表达式按北京时间（UTC+8）解释。用 FixedOffset::east(8*3600)
 //!   作为 croner 的参考时区，find_next_occurrence 返回北京时间的触发时刻，
 //!   转成 UTC 绝对时长后 sleep。
 
-pub mod commands;
 pub mod store;
 
 use anyhow::Result;
@@ -54,7 +53,7 @@ pub async fn run(
     // 预构造 agent 所需的共享件
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
-    let persona = cfg.agent.persona.clone();
+    let persona = crate::config::load_persona("AGENTS.md")?;
     let mut tools = crate::tools::default_tools();
     tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
     let tools = Arc::new(tools);

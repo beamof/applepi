@@ -1,3 +1,4 @@
+pub mod cron;
 pub mod echo;
 pub mod fs;
 // pub mod search; // 联网搜索工具示例：取消注释并在 default_tools 中注册

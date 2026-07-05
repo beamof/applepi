@@ -28,11 +28,11 @@ telegram:
   # bot_token 留空则从环境变量 TELEGRAM_BOT_TOKEN 读取
   bot_token: ""
 
-# MCP 服务器（Streamable HTTP 传输）。留空数组表示不接入任何 MCP 服务器。
+# MCP 服务器（Streamable HTTP 传输）。不接入时整段注释掉或留空。
 # 示例：
 #   - name: example
 #     url: https://mcp.example.com/mcp
 #     headers:           # 可选，额外请求头
 #       Authorization: "Bearer xxx"
 #     enabled: true      # 可选，默认 true
-mcp_servers: []
+# mcp_servers: []

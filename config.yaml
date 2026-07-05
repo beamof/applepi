@@ -36,3 +36,17 @@ telegram:
 #       Authorization: "Bearer xxx"
 #     enabled: true      # 可选，默认 true
 # mcp_servers: []
+
+# Cron 定时任务（仅 bot 模式生效）。enabled: false 表示不启用。
+# 启用时把 enabled 改为 true，可同时配置种子 job（首次启动写入 DB，之后由 /cron 命令管理）。
+# cron:
+#   enabled: true
+#   db_path: data/cron.db
+#   jobs:
+#     - name: daily_summary
+#       schedule: "0 9 * * *"      # 北京时间每天 9:00
+#       prompt: "总结今天的待办"
+#       chat_id: 123456789         # 推送目标 Telegram chat_id
+#       enabled: true
+cron:
+  enabled: false

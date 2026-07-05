@@ -1,6 +1,7 @@
 use crate::llm::LlmConfig;
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -12,6 +13,9 @@ pub struct Config {
     pub memory: MemorySection,
     #[serde(default)]
     pub telegram: TelegramSection,
+    /// MCP 服务器列表（Streamable HTTP 传输）。默认空。
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -52,6 +56,25 @@ impl MemorySection {
 pub struct TelegramSection {
     #[serde(default)]
     pub bot_token: String,
+}
+
+/// 单个 MCP 服务器配置（HTTP/SSE 传输）。
+#[derive(Deserialize, Clone)]
+pub struct McpServerConfig {
+    /// 名称，仅用于日志标识。
+    pub name: String,
+    /// MCP endpoint URL。
+    pub url: String,
+    /// 额外请求头（如 Authorization）。
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// 是否启用，默认 true。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn load(path: &str) -> Result<Config> {

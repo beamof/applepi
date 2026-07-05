@@ -95,6 +95,10 @@ applepi/
     ├── memory/
     │   ├── short_term.rs   # 会话上下文
     │   └── long_term.rs    # ★ SQLite + 向量 + cosine 检索
+    ├── mcp/                # ★ MCP 接入（HTTP/SSE 传输）
+    │   ├── mod.rs          # 加载入口 + 工具合并
+    │   ├── client.rs       # Streamable HTTP JSON-RPC 客户端
+    │   └── tool.rs         # 远端工具 → 本地 Tool 适配器
     ├── tools/
     │   ├── mod.rs          # Tool trait + 注册表（扩展点）
     │   ├── echo.rs         # 示例工具
@@ -143,6 +147,28 @@ let tools: Vec<Arc<dyn Tool>> = vec![
 ];
 ```
 
+### MCP 服务器接入（`mcp/`）
+
+除本地实现的工具外，applepi 还能接入**远程 MCP 服务器**（[Model Context Protocol](https://modelcontextprotocol.io)，Streamable HTTP 传输）。启动时自动握手 + 拉取远端工具列表，每个远端工具被包装成本地 `Tool` 注入 Agent，**无需改一行 Agent 代码**。
+
+在 `config.yaml` 声明即可：
+
+```yaml
+mcp_servers:
+  - name: example
+    url: https://mcp.example.com/mcp
+    headers:                       # 可选，额外请求头
+      Authorization: "Bearer xxx"
+    enabled: true                  # 可选，默认 true
+```
+
+行为约定：
+
+- **零侵入**：复用现有 `Tool` trait / `ToolMap`，Agent 主循环不变。
+- **错误隔离**：单个服务器连接失败只打印 `[MCP]` 警告并跳过，不阻断启动；工具调用失败走现有 `[工具错误]` 路径喂回模型。
+- **连接共享**：同一服务器的多个工具共享一个连接，避免重复握手。
+- **工具名冲突**：同名工具后者覆盖前者（HashMap 语义），覆盖时打印警告。
+
 ### ReAct 主循环（`agent.rs`）
 
 ```
@@ -185,6 +211,7 @@ let tools: Vec<Arc<dyn Tool>> = vec![
 | `memory.db_path` | SQLite 路径 | `data/applepi.db` |
 | `memory.top_k` | 注入记忆条数 | `3` |
 | `telegram.bot_token` | Telegram token | 留空则读环境变量 |
+| `mcp_servers` | MCP 服务器列表（HTTP/SSE） | `[]`（不接入） |
 
 ---
 

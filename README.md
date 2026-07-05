@@ -38,6 +38,7 @@ memory:
 
 > API Key 优先级：`config.yaml` > 环境变量 `OPENAI_API_KEY`（或 `API_KEY`）。
 > 生产环境建议用环境变量，避免 key 进入 git。
+> 环境变量模板见 [`.env.example`](./.env.example)，复制为 `.env` 后填写。
 
 ### 3. 运行
 

@@ -49,7 +49,9 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
     let persona = cfg.agent.persona.clone();
-    let tools = crate::tools::default_tools();
+    // 合并默认工具 + MCP 远端工具（启动时一次性握手拉取，每个 chat 共享同一份）
+    let mut tools = crate::tools::default_tools();
+    tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
     let top_k = cfg.memory.top_k_or(3);
 
     // 预热 long_term（共享 embedding 客户端即可，每个 agent 各持一份简化处理）

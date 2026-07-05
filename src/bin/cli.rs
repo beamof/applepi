@@ -4,6 +4,7 @@ mod lib_decl {
 
 use applepi::agent::{Agent, AgentEvent};
 use applepi::config;
+use applepi::mcp;
 use applepi::memory::long_term::LongTermMemory;
 use applepi::tools::default_tools;
 use std::io::{self, BufRead, Write};
@@ -21,10 +22,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // 合并默认工具 + MCP 远端工具
+    let mut tools = default_tools();
+    tools.extend(mcp::load_mcp_tools(&cfg.mcp_servers).await?);
+
     let mut agent = Agent::new(
         cfg.llm_config(api_key),
         cfg.agent.persona,
-        default_tools(),
+        tools,
         long_term,
         cfg.memory.top_k_or(3),
     );

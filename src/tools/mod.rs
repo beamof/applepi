@@ -2,6 +2,7 @@ pub mod cron;
 pub mod echo;
 pub mod fs;
 pub mod shell;
+pub mod skill;
 // pub mod search; // 联网搜索工具示例：取消注释并在 default_tools 中注册
 
 use anyhow::Result;
@@ -27,6 +28,8 @@ pub fn default_tools() -> ToolMap {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(echo::Echo),
         Arc::new(fs::ReadFile),
+        Arc::new(skill::SkillCreateTool),
+        Arc::new(skill::SkillUseTool),
         // Arc::new(search::Search::default()),
     ];
     tools

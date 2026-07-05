@@ -86,6 +86,7 @@ applepi/
 ├── AGENTS.md               # 人设（系统提示）
 ├── config.yaml             # 模型、记忆、Telegram、MCP、Cron 配置
 ├── Cargo.toml
+├── skills/                 # ★ 技能（每个子目录一个 SKILL.md）
 └── src/
     ├── lib.rs              # 模块入口
     ├── main → 拆为 bin/    # 两个可执行入口
@@ -108,7 +109,8 @@ applepi/
     │   ├── cron.rs         # cron 管理工具（agent 调用）
     │   ├── echo.rs         # 示例工具
     │   ├── fs.rs           # read_file 工具
-    │   └── shell.rs        # shell 命令工具（白名单/黑名单）
+    │   ├── shell.rs        # shell 命令工具（白名单/黑名单）
+    │   └── skill.rs        # 技能创建/运行工具
     └── bin/
         ├── cli.rs          # 终端入口
         └── bot.rs          # Telegram 入口
@@ -216,6 +218,24 @@ shell:
 ```
 
 > ⚠️ **安全提醒**：白名单/黑名单是字符串匹配，**不是沙箱**，无法防御利用 shell 特性（管道、变量拼接等）构造的绕过。仅在可信环境、可信输入下启用；生产/多用户场景请用容器隔离或保持 `enabled: false`。
+
+### 技能 Skills（`tools/skill.rs`，Claude Skills 风格）
+
+技能是持久化的工作流/指令模板（`skills/<name>/SKILL.md`），让 agent 把重复性任务沉淀为可复用资产。agent 内置两个工具：
+
+- `skill_create(name, description, content)` — 创建/更新技能文件
+- `skill_use(name)` — 加载技能正文为本次任务上下文，agent 据此调用其他工具完成工作
+
+```markdown
+---
+name: code-review
+description: 代码评审工作流，检查风格与安全并给出结构化反馈
+---
+# 代码评审
+...（具体指令）
+```
+
+启动时自动扫描 `skills/` 目录，把所有技能的 name + description 摘要注入人设，让 agent 感知可用技能。技能就是 Markdown 文件，人也能直接编辑。
 
 ### ReAct 主循环（`agent.rs`）
 

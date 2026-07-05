@@ -98,6 +98,11 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
         let t = Arc::new(crate::tools::cron::CronTool::new(store.clone(), reload_tx.clone()));
         tools.insert(t.name().to_string(), t);
     }
+    // Shell 工具（可选，受白名单/黑名单约束）
+    if cfg.shell.enabled {
+        let t = Arc::new(crate::tools::shell::ShellTool::new(&cfg.shell));
+        tools.insert(t.name().to_string(), t);
+    }
     let top_k = cfg.memory.top_k_or(3);
 
     let mut offset: Option<i64> = None;

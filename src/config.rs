@@ -18,6 +18,9 @@ pub struct Config {
     /// Cron 定时任务（仅 bot 模式生效）。默认禁用。
     #[serde(default)]
     pub cron: CronSection,
+    /// Shell 工具配置。默认禁用。
+    #[serde(default)]
+    pub shell: ShellSection,
 }
 
 #[derive(Deserialize, Clone)]
@@ -107,6 +110,64 @@ pub struct CronJob {
     /// 是否启用，默认 true。
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+fn default_timeout() -> u64 {
+    30
+}
+
+/// 默认危险命令黑名单（即使配置里不写 deny 也有这层保护）。
+fn default_deny() -> Vec<String> {
+    [
+        "rm -rf", "sudo ", " >/", " >>/", "mkfs", "dd if=", ":(){",
+        "chmod 777", "reboot", "shutdown", "halt", ":(){:|:&};:",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// Shell 工具配置。
+#[derive(Deserialize, Clone)]
+pub struct ShellSection {
+    /// 是否启用 shell 工具，默认 false（安全默认）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 允许的命令前缀白名单。非空时只允许命令以其中任一前缀开头；为空则不限制（仅靠黑名单）。
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// 禁止的子串黑名单。命令含其中任一子串即拒绝。为空时使用内置默认黑名单。
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// 执行超时（秒），默认 30。
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+    /// 工作目录，留空 = 当前目录。
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+impl Default for ShellSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            timeout: default_timeout(),
+            workdir: None,
+        }
+    }
+}
+
+impl ShellSection {
+    /// 取生效的黑名单：配置非空用配置，否则用默认。
+    pub fn effective_deny(&self) -> Vec<String> {
+        if self.deny.is_empty() {
+            default_deny()
+        } else {
+            self.deny.clone()
+        }
+    }
 }
 
 pub fn load(path: &str) -> Result<Config> {

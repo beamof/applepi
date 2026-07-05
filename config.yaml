@@ -46,3 +46,19 @@ telegram:
 #       enabled: true
 cron:
   enabled: false
+
+# Shell 工具：让 agent 执行 shell 命令（受白名单/黑名单约束）。
+# ⚠️ 安全提醒：白名单/黑名单是字符串匹配，不是沙箱，无法防御利用 shell 特性构造的绕过。
+#    仅在可信环境、可信输入下启用；生产/多用户场景请用容器隔离或保持 enabled: false。
+# shell:
+#   enabled: true
+#   allow:                     # 命令前缀白名单，为空则不限制（仅靠黑名单）
+#     - "ls"
+#     - "cat "
+#     - "git status"
+#     - "pwd"
+#   deny: []                   # 子串黑名单，为空则使用内置默认（rm -rf / sudo / mkfs 等危险词）
+#   timeout: 30                # 执行超时（秒）
+#   # workdir: /tmp            # 工作目录，留空 = 当前目录
+shell:
+  enabled: false

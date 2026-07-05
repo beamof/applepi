@@ -107,7 +107,8 @@ applepi/
     │   ├── mod.rs          # Tool trait + 注册表（扩展点）
     │   ├── cron.rs         # cron 管理工具（agent 调用）
     │   ├── echo.rs         # 示例工具
-    │   └── fs.rs           # read_file 工具
+    │   ├── fs.rs           # read_file 工具
+    │   └── shell.rs        # shell 命令工具（白名单/黑名单）
     └── bin/
         ├── cli.rs          # 终端入口
         └── bot.rs          # Telegram 入口
@@ -202,6 +203,20 @@ cron:
 - **独立 Agent**：每个任务一个独立 Agent，不与 bot 的对话 Agent 共享状态/锁。
 - **热重载**：agent 通过 `cron` 工具改动 DB 后，经 watch 通道立即生效，无需重启进程。
 
+### Shell 工具（`tools/shell.rs`，可选）
+
+让 agent 执行 shell 命令。默认关闭，启用后受**白名单/黑名单**约束：
+
+```yaml
+shell:
+  enabled: true
+  allow: ["ls", "cat ", "git status", "pwd"]  # 命令前缀白名单，空则不限
+  deny: []                                     # 子串黑名单，空则用内置默认
+  timeout: 30
+```
+
+> ⚠️ **安全提醒**：白名单/黑名单是字符串匹配，**不是沙箱**，无法防御利用 shell 特性（管道、变量拼接等）构造的绕过。仅在可信环境、可信输入下启用；生产/多用户场景请用容器隔离或保持 `enabled: false`。
+
 ### ReAct 主循环（`agent.rs`）
 
 ```
@@ -248,6 +263,10 @@ cron:
 | `cron.enabled` | 是否启用定时任务 | `false` |
 | `cron.db_path` | Cron 持久化库路径 | `data/cron.db` |
 | `cron.jobs` | 种子任务列表（首次写入 DB） | `[]`（无） |
+| `shell.enabled` | 是否启用 shell 工具 | `false` |
+| `shell.allow` | 命令前缀白名单 | `[]`（不限制） |
+| `shell.deny` | 子串黑名单（空用内置默认） | `[]` |
+| `shell.timeout` | 执行超时（秒） | `30` |
 
 ---
 

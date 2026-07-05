@@ -6,8 +6,9 @@ use applepi::agent::{Agent, AgentEvent};
 use applepi::config;
 use applepi::mcp;
 use applepi::memory::long_term::LongTermMemory;
-use applepi::tools::default_tools;
+use applepi::tools::{default_tools, Tool};
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,6 +28,11 @@ async fn main() -> anyhow::Result<()> {
     // 合并默认工具 + MCP 远端工具
     let mut tools = default_tools();
     tools.extend(mcp::load_mcp_tools(&cfg.mcp_servers).await?);
+    // Shell 工具（可选，受白名单/黑名单约束）
+    if cfg.shell.enabled {
+        let t = Arc::new(applepi::tools::shell::ShellTool::new(&cfg.shell));
+        tools.insert(t.name().to_string(), t);
+    }
 
     let mut agent = Agent::new(
         cfg.llm_config(api_key),

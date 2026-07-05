@@ -19,7 +19,7 @@
 
 ### 2. 配置
 
-编辑 [`config.yaml`](./config.yaml)，至少填好 `llm.api_key` 和 `llm.model`：
+人设在 [`AGENTS.md`](./AGENTS.md) 里维护（启动时读一次）。其余配置在 [`config.yaml`](./config.yaml)，至少填好 `llm.api_key` 和 `llm.model`：
 
 ```yaml
 llm:
@@ -83,7 +83,8 @@ cargo build --release --bins
 
 ```
 applepi/
-├── config.yaml             # 人设、模型、记忆、Telegram 配置
+├── AGENTS.md               # 人设（系统提示）
+├── config.yaml             # 模型、记忆、Telegram、MCP、Cron 配置
 ├── Cargo.toml
 └── src/
     ├── lib.rs              # 模块入口
@@ -101,10 +102,10 @@ applepi/
     │   └── tool.rs         # 远端工具 → 本地 Tool 适配器
     ├── cron/               # ★ 定时任务（仅 bot 模式）
     │   ├── mod.rs          # scheduler：cron 触发 + 独立 Agent 推送
-    │   ├── store.rs        # SQLite 持久化
-    │   └── commands.rs     # /cron 命令解析
+    │   └── store.rs        # SQLite 持久化
     ├── tools/
     │   ├── mod.rs          # Tool trait + 注册表（扩展点）
+    │   ├── cron.rs         # cron 管理工具（agent 调用）
     │   ├── echo.rs         # 示例工具
     │   └── fs.rs           # read_file 工具
     └── bin/
@@ -183,7 +184,7 @@ mcp_servers:
 cron:
   enabled: true                  # 总开关
   db_path: data/cron.db          # 持久化库（与长期记忆库分库）
-  jobs:                          # 启动时种子 job（首次写入 DB，之后由 /cron 命令管理）
+  jobs:                          # 启动时种子 job（首次写入 DB，之后由 cron 工具管理）
     - name: daily_summary
       schedule: "0 9 * * *"      # 北京时间每天 9:00
       prompt: "总结今天的待办"
@@ -191,18 +192,7 @@ cron:
       enabled: true
 ```
 
-**运行时管理**（在 Telegram 里直接发命令）：
-
-| 命令 | 作用 |
-|---|---|
-| `/cron list` | 列出所有任务 |
-| `/cron add <name> "<cron>" <chat_id> <prompt...>` | 新增任务 |
-| `/cron del <id>` | 删除任务 |
-| `/cron pause <id>` | 暂停任务 |
-| `/cron resume <id>` | 恢复任务 |
-| `/cron help` | 帮助 |
-
-示例：`/cron add 早报 "0 9 * * *" 123456 给出今日待办`
+**运行时管理**：agent 内置 `cron` 工具，用户用自然语言对话即可让 agent 创建/查询/暂停/删除任务，无需手动发命令。例如用户说"每天 9 点提醒我站会，chat_id 是 123"，agent 会直接调用 `cron` 工具（action=add）创建任务。详见 [`AGENTS.md`](./AGENTS.md)。
 
 **设计要点：**
 
@@ -210,7 +200,7 @@ cron:
 - **时区**：cron 表达式按**北京时间（UTC+8）**解释。
 - **错过不补**：进程停机期间错过的任务跳过，重启后从下次匹配时间继续。
 - **独立 Agent**：每个任务一个独立 Agent，不与 bot 的对话 Agent 共享状态/锁。
-- **热重载**：`/cron` 命令改动后通过 watch 通道立即生效，无需重启进程。
+- **热重载**：agent 通过 `cron` 工具改动 DB 后，经 watch 通道立即生效，无需重启进程。
 
 ### ReAct 主循环（`agent.rs`）
 
@@ -244,7 +234,7 @@ cron:
 
 | 配置路径 | 说明 | 默认/备注 |
 |---|---|---|
-| `agent.persona` | 人设 / 系统提示 | 必填 |
+| `AGENTS.md` | 人设 / 系统提示 | 必填（项目根目录） |
 | `llm.api_base` | OpenAI 兼容接口地址 | 必填 |
 | `llm.model` | 模型名 | 必填 |
 | `llm.api_key` | API Key | 留空则读环境变量 |

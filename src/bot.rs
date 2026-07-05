@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
+use crate::tools::Tool;
 
 #[derive(Deserialize)]
 struct Update {
@@ -48,11 +49,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
 
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
-    let persona = cfg.agent.persona.clone();
-    // 合并默认工具 + MCP 远端工具（启动时一次性握手拉取，每个 chat 共享同一份）
-    let mut tools = crate::tools::default_tools();
-    tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
-    let top_k = cfg.memory.top_k_or(3);
+    let persona = crate::config::load_persona("AGENTS.md")?;
 
     // 预热 long_term（共享 embedding 客户端即可，每个 agent 各持一份简化处理）
     let long_term = if cfg.memory.enabled {
@@ -67,13 +64,13 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     // 这里为简化，每个 agent 重新 open 一份（SQLite 多连接没问题）。
     drop(long_term);
 
-    // Cron scheduler：仅当启用时启动。watch 通道用于 /cron 命令改动后通知重载。
+    // Cron scheduler：仅当启用时启动。watch 通道用于 agent 通过 cron 工具改动后通知重载。
+    // 必须在 tools 构建前完成，以便把 store 注入 CronTool。
     let (reload_tx, reload_rx) = tokio::sync::watch::channel(());
-    let mut cron_store: Option<Arc<crate::cron::store::CronStore>> = None;
-    if cfg.cron.enabled {
+    let cron_store: Option<Arc<crate::cron::store::CronStore>> = if cfg.cron.enabled {
         match crate::cron::store::CronStore::open(&cfg.cron.db_path) {
             Ok(s) => {
-                cron_store = Some(Arc::new(s));
+                let store = Arc::new(s);
                 let n = cfg.cron.jobs.len();
                 tracing::info!("Cron 已启用（{} 个种子任务待写入）", n);
                 tokio::spawn(crate::cron::run(
@@ -83,10 +80,25 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     base.clone(),
                     reload_rx,
                 ));
+                Some(store)
             }
-            Err(e) => tracing::error!("Cron DB 打开失败，scheduler 未启动: {e}"),
+            Err(e) => {
+                tracing::error!("Cron DB 打开失败，scheduler 未启动: {e}");
+                None
+            }
         }
+    } else {
+        None
+    };
+
+    // 合并默认工具 + MCP 远端工具 + Cron 管理工具（启动时一次性构建，每个 chat 共享同一份）
+    let mut tools = crate::tools::default_tools();
+    tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
+    if let Some(store) = &cron_store {
+        let t = Arc::new(crate::tools::cron::CronTool::new(store.clone(), reload_tx.clone()));
+        tools.insert(t.name().to_string(), t);
     }
+    let top_k = cfg.memory.top_k_or(3);
 
     let mut offset: Option<i64> = None;
     tracing::info!("Telegram bot 已启动，开始长轮询...");
@@ -123,22 +135,6 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             let Some(text) = msg.text else { continue };
             let chat_id = msg.chat.id;
             if text.trim().is_empty() {
-                continue;
-            }
-
-            // /cron 命令分发（不走 agent）
-            if text.trim_start().starts_with("/cron") {
-                let reply = match &cron_store {
-                    Some(store) => {
-                        crate::cron::commands::handle(&text, store, &reload_tx).await
-                    }
-                    None => "Cron 未启用（config.yaml 的 cron.enabled = false）。".into(),
-                };
-                let _ = http
-                    .post(format!("{base}/sendMessage"))
-                    .json(&json!({ "chat_id": chat_id, "text": reply }))
-                    .send()
-                    .await;
                 continue;
             }
 
@@ -181,7 +177,9 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             let result: Result<String> = async {
                 let mut map = agents.lock().await;
                 let agent = map.get_mut(&chat_id).unwrap();
-                let events = agent.chat_stream(&text).await?;
+                // 把当前 chat_id 注入上下文，供 cron 等工具使用（用户无需手动提供）
+                let input = format!("[chat_id: {chat_id}]\n\n{text}");
+                let events = agent.chat_stream(&input).await?;
                 let mut buf = String::new();
                 let mut last_len = 0;
                 for ev in events {

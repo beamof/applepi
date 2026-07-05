@@ -49,7 +49,8 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
 
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
-    let persona = crate::config::load_persona("AGENTS.md")?;
+    let mut persona = crate::config::load_persona("AGENTS.md")?;
+    persona.push_str(&crate::config::load_skills_summary("skills"));
 
     // 预热 long_term（共享 embedding 客户端即可，每个 agent 各持一份简化处理）
     let long_term = if cfg.memory.enabled {

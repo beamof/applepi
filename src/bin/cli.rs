@@ -17,7 +17,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::load("config.yaml")?;
     let api_key = cfg.resolve_api_key()?;
-    let persona = config::load_persona("AGENTS.md")?;
+    let mut persona = config::load_persona("AGENTS.md")?;
+    persona.push_str(&config::load_skills_summary("skills"));
 
     let long_term = if cfg.memory.enabled {
         Some(LongTermMemory::open(&cfg.memory.db_path, cfg.embeddings_config(api_key.clone()))?)

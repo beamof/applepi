@@ -187,6 +187,67 @@ pub fn load_persona(path: &str) -> Result<String> {
     Ok(raw.trim().to_string())
 }
 
+/// 扫描 skills/ 目录，返回所有技能的 name + description 摘要（用于注入人设）。
+///
+/// 遍历 `skills/<name>/SKILL.md`，解析 YAML frontmatter 提取 name + description。
+/// 无技能目录、单文件解析失败均不阻断，返回空串或部分结果。
+pub fn load_skills_summary(skills_dir: &str) -> String {
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(_) => return String::new(), // 目录不存在 = 无技能，静默
+    };
+
+    let mut items: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join("SKILL.md");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue; // 该子目录无 SKILL.md，跳过
+        };
+        if let Some((name, desc)) = parse_frontmatter(&content) {
+            // name 缺失时用目录名兜底
+            let name = if name.is_empty() {
+                entry.file_name().to_string_lossy().into_owned()
+            } else {
+                name
+            };
+            items.push((name, desc));
+        }
+    }
+
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n\n## 可用技能\n");
+    for (name, desc) in &items {
+        out.push_str(&format!("- {name}: {desc}\n"));
+    }
+    out.push_str("用 skill_use(\"技能名\") 运行技能；用 skill_create 创建新技能。");
+    out
+}
+
+/// 从 SKILL.md 内容解析 frontmatter 的 name 与 description。
+/// 格式：首行 `---`，随后若干 `key: value`，再 `---` 结束。
+fn parse_frontmatter(content: &str) -> Option<(String, String)> {
+    let content = content.trim_start();
+    let after_opening = content.strip_prefix("---")?;
+    // 找闭合 ---
+    let end = after_opening.find("\n---")?;
+    let fm = &after_opening[..end];
+
+    let mut name = String::new();
+    let mut desc = String::new();
+    for line in fm.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("name:") {
+            name = v.trim().trim_matches('"').to_string();
+        } else if let Some(v) = line.strip_prefix("description:") {
+            desc = v.trim().trim_matches('"').to_string();
+        }
+    }
+    Some((name, desc))
+}
+
 impl Config {
     /// 统一取 API key：config 优先，环境变量兜底。
     pub fn resolve_api_key(&self) -> Result<String> {

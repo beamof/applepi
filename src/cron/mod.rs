@@ -214,14 +214,26 @@ async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
 
     let events = agent.chat_stream(&job.prompt).await?;
     let mut reply = String::new();
+    let mut exhausted = false;
     for ev in events {
-        if let AgentEvent::Final(t) = ev {
-            reply = t;
-            break;
+        match ev {
+            AgentEvent::Final(t) => {
+                reply = t;
+                break;
+            }
+            AgentEvent::ContinuePrompt(_) => {
+                // 定时任务无人值守，无法询问用户，记为耗尽自动停止
+                exhausted = true;
+            }
+            _ => {}
         }
     }
     if reply.is_empty() {
-        reply = "（无输出）".into();
+        reply = if exhausted {
+            "（已达最大轮次上限，定时任务无人值守，自动停止）".into()
+        } else {
+            "（无输出）".into()
+        };
     }
     // Telegram 文本上限 4096，截断保护
     let safe: String = reply.chars().take(4000).collect();

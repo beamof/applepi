@@ -60,8 +60,9 @@ async fn main() -> anyhow::Result<()> {
         print!("\napplepi: ");
         io::stdout().flush()?;
         match agent.chat_stream(&line).await {
-            Ok(events) => {
-                for ev in events {
+            Ok(mut events) => loop {
+                let mut need_continue = false;
+                for ev in events.drain(..) {
                     match ev {
                         AgentEvent::Text(t) => {
                             print!("{t}");
@@ -74,12 +75,48 @@ async fn main() -> anyhow::Result<()> {
                         AgentEvent::ToolError(e) => {
                             eprintln!("\n  [{e}]");
                         }
+                        AgentEvent::ContinuePrompt(note) => {
+                            eprintln!("\n{note}");
+                            need_continue = true;
+                        }
                     }
                 }
-                println!("\n");
-            }
+
+                if !need_continue {
+                    println!("\n");
+                    break;
+                }
+
+                // 询问是否继续
+                print!("\n是否继续？[y/N] ");
+                io::stdout().flush()?;
+                let Some(reply) = lines.next() else { break };
+                let reply = reply.unwrap_or_default();
+                if !is_affirmative(&reply) {
+                    eprintln!("（已停止）\n");
+                    break;
+                }
+                // 同意 → 重置计数续跑（续跑本身可能再次耗尽，循环再问）
+                print!("\napplepi: ");
+                io::stdout().flush()?;
+                match agent.continue_stream().await {
+                    Ok(next) => events = next,
+                    Err(e) => {
+                        eprintln!("\n[错误] {e}\n");
+                        break;
+                    }
+                }
+            },
             Err(e) => eprintln!("\n[错误] {e}\n"),
         }
     }
     Ok(())
+}
+
+/// 判断用户回复是否为肯定（继续/continue/yes/y/是/1，忽略大小写与空白）。
+fn is_affirmative(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "继续" | "是" | "好" | "好的" | "ok" | "continue" | "yes" | "y" | "1"
+    )
 }

@@ -6,7 +6,7 @@ use crate::memory::long_term::LongTermMemory;
 use crate::memory::short_term::History;
 use crate::tools::ToolMap;
 
-const MAX_TURNS: usize = 6;
+pub const MAX_TURNS: usize = 64;
 
 /// Agent 主入口：持有配置、工具、记忆。
 pub struct Agent {
@@ -16,6 +16,8 @@ pub struct Agent {
     pub(crate) history: History,
     pub(crate) long_term: Option<LongTermMemory>,
     pub(crate) top_k: usize,
+    /// 最近一次用户输入，供续跑成功后写入长期记忆用。
+    pub(crate) last_input: Option<String>,
 }
 
 /// 一次对话产出的事件流。调用方据此渲染 UI（终端逐字、Telegram 增量编辑）。
@@ -29,6 +31,9 @@ pub enum AgentEvent {
     Final(String),
     /// 工具调用出错（已捕获，作为结果喂回模型继续）
     ToolError(String),
+    /// 达到本轮上限（MAX_TURNS）仍未给出最终答复，需询问用户是否继续。
+    /// 携带字符串 = 给用户看的提示语。同意续跑则用 continue_stream 重置计数继续。
+    ContinuePrompt(String),
 }
 
 impl Agent {
@@ -46,14 +51,28 @@ impl Agent {
             history: History::new(persona),
             long_term,
             top_k,
+            last_input: None,
         }
     }
 
     /// 流式对话。返回事件流。
     pub async fn chat_stream(&mut self, input: &str) -> Result<Vec<AgentEvent>> {
+        self.last_input = Some(input.to_string());
         self.recall_and_inject(input).await;
         self.history.add(Message::user(input));
+        self.turn_loop().await
+    }
 
+    /// 续跑：在达到本轮上限后，经用户同意则调用本方法，重置计数从 0 重新开始。
+    /// 复用现有 history（末尾是 tool_result），不重新注入用户输入。
+    pub async fn continue_stream(&mut self) -> Result<Vec<AgentEvent>> {
+        self.turn_loop().await
+    }
+
+    /// 一轮上限内的循环：最多 MAX_TURNS 次模型往返。
+    /// - 收到纯文本答复 → 入历史、存记忆、发 Final、结束。
+    /// - 全部耗尽仍未收尾 → 发 ContinuePrompt、结束（由调用方决定是否 continue_stream 续跑）。
+    async fn turn_loop(&mut self) -> Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
         for _ in 0..MAX_TURNS {
             let mut rx = chat_stream(
@@ -122,12 +141,15 @@ impl Agent {
             });
             events.push(AgentEvent::Final(text_buf));
             // 异步存记忆（不阻塞返回）
-            self.maybe_remember(input).await;
+            if let Some(input) = self.last_input.as_deref() {
+                self.maybe_remember(input).await;
+            }
             return Ok(events);
         }
-        events.push(AgentEvent::Final(
-            "（达到最大轮次，仍未给出最终答复）".into(),
-        ));
+        // 全部轮次耗尽仍未给出最终答复：询问用户是否继续
+        events.push(AgentEvent::ContinuePrompt(format!(
+            "（已达到最大轮次 {MAX_TURNS}，是否继续？回复「继续」即可）"
+        )));
         Ok(events)
     }
 

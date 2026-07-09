@@ -46,6 +46,9 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
 
     // 每个 chat_id 一个独立 Agent（独立记忆上下文）
     let agents: Arc<Mutex<HashMap<i64, Agent>>> = Arc::new(Mutex::new(HashMap::new()));
+    // chat_id → 正在等待用户确认是否续跑的占位消息 id。下一条消息为肯定词则续跑，
+    // 否则视作新输入。
+    let pending_continue: Arc<Mutex<HashMap<i64, i64>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
@@ -167,53 +170,69 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 });
             }
 
-            // 先发一条占位消息，后续逐段编辑更新（流式体验）
-            let placeholder = http
-                .post(format!("{base}/sendMessage"))
-                .json(&json!({ "chat_id": chat_id, "text": "…" }))
-                .send()
-                .await?
-                .json::<serde_json::Value>()
-                .await?;
-            let msg_id = placeholder
-                .get("result")
-                .and_then(|r| r.get("message_id"))
-                .and_then(|v| v.as_i64());
+            // 先取走待续跑确认状态（若上一轮耗尽）
+            let pending_msg_id = pending_continue.lock().await.remove(&chat_id);
 
-            let result: Result<String> = async {
+            let result: Result<()> = async {
                 let mut map = agents.lock().await;
                 let agent = map.get_mut(&chat_id).unwrap();
+
+                // 续跑确认分支：上一轮耗尽，用户回复肯定词则继续（沿用原占位消息）
+                if let Some(msg_id) = pending_msg_id {
+                    if is_affirmative(&text) {
+                        let events = agent.continue_stream().await?;
+                        let (buf, pending) =
+                            render_events(&http, &base, chat_id, Some(msg_id), events).await;
+                        if pending {
+                            pending_continue.lock().await.insert(chat_id, msg_id);
+                        } else {
+                            edit_text(&http, &base, chat_id, Some(msg_id), &buf).await;
+                        }
+                        return Ok(());
+                    }
+                    // 非肯定词 → 放弃续跑，按新输入处理
+                }
+
+                // 正常新输入：先发一条占位消息，后续逐段编辑更新（流式体验）
+                let placeholder = http
+                    .post(format!("{base}/sendMessage"))
+                    .json(&json!({ "chat_id": chat_id, "text": "…" }))
+                    .send()
+                    .await?
+                    .json::<serde_json::Value>()
+                    .await?;
+                let msg_id = placeholder
+                    .get("result")
+                    .and_then(|r| r.get("message_id"))
+                    .and_then(|v| v.as_i64());
+
                 // 把当前 chat_id 注入上下文，供 cron 等工具使用（用户无需手动提供）
                 let input = format!("[chat_id: {chat_id}]\n\n{text}");
                 let events = agent.chat_stream(&input).await?;
-                let mut buf = String::new();
-                let mut last_len = 0;
-                for ev in events {
-                    match ev {
-                        AgentEvent::Text(t) => {
-                            buf.push_str(&t);
-                            // 节流：每攒够 ~120 字符或完成时编辑一次
-                            if buf.len().saturating_sub(last_len) >= 120 {
-                                last_len = buf.len();
-                                edit_text(&http, &base, chat_id, msg_id, &buf).await;
-                            }
-                        }
-                        AgentEvent::Final(t) => {
-                            buf = t;
-                        }
-                        _ => {}
+                let (buf, pending) = render_events(&http, &base, chat_id, msg_id, events).await;
+                if pending {
+                    // 耗尽：挂起等待用户确认，不做最终编辑（消息已显示提问）
+                    if let Some(id) = msg_id {
+                        pending_continue.lock().await.insert(chat_id, id);
                     }
+                } else {
+                    edit_text(&http, &base, chat_id, msg_id, &buf).await;
                 }
-                Ok(buf)
+                Ok(())
             }
             .await;
 
-            match result {
-                Ok(reply) => {
-                    edit_text(&http, &base, chat_id, msg_id, &reply).await;
-                }
-                Err(e) => {
-                    let _ = edit_text(&http, &base, chat_id, msg_id, &format!("[错误] {e}")).await;
+            if let Err(e) = result {
+                // 优先复用已知 msg_id 编辑，否则新发一条错误消息
+                if let Some(msg_id) = pending_msg_id {
+                    let _ =
+                        edit_text(&http, &base, chat_id, Some(msg_id), &format!("[错误] {e}")).await;
+                } else {
+                    let _ = http
+                        .post(format!("{base}/sendMessage"))
+                        .json(&json!({ "chat_id": chat_id, "text": format!("[错误] {e}") }))
+                        .send()
+                        .await;
                 }
             }
         }
@@ -229,4 +248,52 @@ async fn edit_text(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>,
         .json(&json!({ "chat_id": chat_id, "message_id": msg_id, "text": safe }))
         .send()
         .await;
+}
+
+/// 把事件流渲染到指定占位消息（沿用节流编辑策略）。
+/// 返回 `(最终文本, 是否以 ContinuePrompt 结束)`。
+/// - 节流：每攒够 ~120 字符编辑一次。
+/// - `Final` 覆盖 buf；`ContinuePrompt` 追加提示语并立即编辑一次，返回 `pending=true`。
+async fn render_events(
+    http: &Client,
+    base: &str,
+    chat_id: i64,
+    msg_id: Option<i64>,
+    events: Vec<AgentEvent>,
+) -> (String, bool) {
+    let mut buf = String::new();
+    let mut last_len = 0;
+    let mut pending = false;
+    for ev in events {
+        match ev {
+            AgentEvent::Text(t) => {
+                buf.push_str(&t);
+                if buf.len().saturating_sub(last_len) >= 120 {
+                    last_len = buf.len();
+                    edit_text(http, base, chat_id, msg_id, &buf).await;
+                }
+            }
+            AgentEvent::Final(t) => {
+                buf = t;
+            }
+            AgentEvent::ContinuePrompt(note) => {
+                if !buf.is_empty() {
+                    buf.push_str("\n\n");
+                }
+                buf.push_str(&note);
+                edit_text(http, base, chat_id, msg_id, &buf).await;
+                pending = true;
+            }
+            _ => {}
+        }
+    }
+    (buf, pending)
+}
+
+/// 判断用户回复是否为肯定（继续/继续吧/continue/yes/y/是/好的/1，忽略大小写与空白）。
+fn is_affirmative(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "继续" | "继续吧" | "是" | "好" | "好的" | "ok" | "continue" | "yes" | "y" | "1"
+    )
 }

@@ -30,6 +30,8 @@ struct Chat {
 }
 
 const TG_API: &str = "https://api.telegram.org";
+/// 单条消息处理超时：超时后向用户报错，避免占位消息无限停在「…」。
+const CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     let token = if !cfg.telegram.bot_token.is_empty() {
@@ -215,7 +217,12 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             // 先取走待续跑确认状态（若上一轮耗尽）
             let pending_msg_id = pending_continue.lock().await.remove(&chat_id);
 
-            let result: Result<()> = async {
+            // 占位消息 id 的外层副本：处理 future 内部获取后写入，超时被 drop 时
+            // 外层仍可据此编辑那条停在「…」的消息。
+            let msg_slot: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
+                std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+            let timeout_fut = async {
                 let mut map = agents.lock().await;
                 let agent = map.get_mut(&chat_id).unwrap();
 
@@ -247,6 +254,9 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     .get("result")
                     .and_then(|r| r.get("message_id"))
                     .and_then(|v| v.as_i64());
+                if let Some(id) = msg_id {
+                    *msg_slot.lock().await = Some(id);
+                }
 
                 // 把当前 chat_id 注入上下文，供 cron 等工具使用（用户无需手动提供）
                 let input = format!("[chat_id: {chat_id}]\n\n{text}");
@@ -261,12 +271,20 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     edit_text(&http, &base, chat_id, msg_id, &buf).await;
                 }
                 Ok(())
-            }
-            .await;
+            };
+
+            let result: Result<(), anyhow::Error> =
+                match tokio::time::timeout(CHAT_TIMEOUT, timeout_fut).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => Err(anyhow::anyhow!(
+                        "处理超时（超过 3 分钟未收到回复）。原因可能是：模型/工具调用卡住、网络中断、或任务过于复杂。请重试或换个问法。"
+                    )),
+                };
 
             if let Err(e) = result {
-                // 优先复用已知 msg_id 编辑，否则新发一条错误消息
-                if let Some(msg_id) = pending_msg_id {
+                // 优先复用已写出的占位消息 id 编辑它；否则回退到续跑占位 id；都没有就新发一条
+                let slot_id = msg_slot.lock().await.clone();
+                if let Some(msg_id) = slot_id.or(pending_msg_id) {
                     let _ =
                         edit_text(&http, &base, chat_id, Some(msg_id), &format!("[错误] {e}")).await;
                 } else {

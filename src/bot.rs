@@ -196,7 +196,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 // 正常新输入：先发一条占位消息，后续逐段编辑更新（流式体验）
                 let placeholder = http
                     .post(format!("{base}/sendMessage"))
-                    .json(&json!({ "chat_id": chat_id, "text": "…" }))
+                    .json(&json!({ "chat_id": chat_id, "text": "…", "parse_mode": "HTML" }))
                     .send()
                     .await?
                     .json::<serde_json::Value>()
@@ -230,7 +230,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 } else {
                     let _ = http
                         .post(format!("{base}/sendMessage"))
-                        .json(&json!({ "chat_id": chat_id, "text": format!("[错误] {e}") }))
+                        .json(&json!({ "chat_id": chat_id, "text": format!("[错误] {e}"), "parse_mode": "HTML" }))
                         .send()
                         .await;
                 }
@@ -239,15 +239,279 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     }
 }
 
+/// 把常见 markdown 转成 Telegram 支持的 HTML 子集。
+///
+/// 覆盖的语法：```代码块```、`行内代码`、**粗体**、*斜体*、~~删除线~~、
+/// # 标题、-/* 列表项、[文本](url) 链接。其余原样保留。
+///
+/// 设计保守：先对整段做 HTML 转义（& < >），再处理 markdown 标记，
+/// 替换进去的标签不会被二次转义。代码块内容只整体转义一次，不解析行内标记。
+/// 无法识别的语法原样输出文本，宁可少渲染也不产生非法 HTML 导致发送失败。
+fn md_to_tg_html(md: &str) -> String {
+    // 1. 整体 HTML 转义
+    let escaped = md
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
+    // 2. 按围栏代码块分段处理（``` 或 ~~~）
+    let mut out = String::with_capacity(escaped.len());
+    let mut in_code = false;
+    let mut fence = String::new();
+    let mut code_buf = String::new();
+
+    for line in escaped.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let opens = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        let closes = in_code && !fence.is_empty() && trimmed.starts_with(fence.as_str());
+
+        if !in_code {
+            if opens {
+                in_code = true;
+                fence = trimmed.chars().take(3).collect();
+                code_buf.clear();
+                // 末尾换行属于代码块外，不复制
+            } else {
+                out.push_str(&convert_inline_line(trimmed));
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+        } else if closes {
+            // 闭合代码块
+            in_code = false;
+            fence.clear();
+            out.push_str("<pre><code>");
+            out.push_str(code_buf.trim_end_matches(['\n', '\r']));
+            out.push_str("</code></pre>");
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+            code_buf.clear();
+        } else {
+            // 代码块内部：累计（已转义过，原样）
+            code_buf.push_str(line);
+        }
+    }
+    // 未闭合的代码块兜底：原样包起来输出，避免吞内容
+    if in_code {
+        out.push_str("<pre><code>");
+        out.push_str(code_buf.trim_end_matches(['\n', '\r']));
+        out.push_str("</code></pre>");
+    }
+    out
+}
+
+/// 转换一行非代码内容：标题/列表标记 + 行内标记。
+fn convert_inline_line(line: &str) -> String {
+    // 行首结构性标记（仅处理前缀，不碰行内可能出现的 * 等）
+    let mut s = line.to_string();
+
+    // ATX 标题：# ~ ###### 开头 → <b>（Telegram 无 h1..h6，统一粗体）
+    if let Some(rest) = strip_atx_header(&s) {
+        s = format!("<b>{rest}</b>");
+    } else if s.starts_with("- ") || s.starts_with("* ") {
+        // 无序列表项：保留 `- ` 前缀，内容转行内
+        let (mark, rest) = s.split_at(2);
+        s = format!("{mark}{}", convert_inline(rest));
+    } else if let Some(rest) = strip_ordered_item(&s) {
+        // 有序列表项 "1. " → 保留前缀
+        let dot = s.len() - rest.len();
+        let mark = &s[..dot];
+        s = format!("{mark}{}", convert_inline(rest));
+    } else {
+        s = convert_inline(&s);
+    }
+    s
+}
+
+/// 去掉行首的 `#`..`######` 与空格，返回剩余内容；不匹配返回 None。
+fn strip_atx_header(s: &str) -> Option<String> {
+    let hashes = s.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &s[hashes..];
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    // # 后必须紧跟空格才算标题
+    if rest.starts_with(' ') {
+        Some(rest.trim_start().to_string())
+    } else {
+        None
+    }
+}
+
+/// 识别有序列表项前缀 "数字. "，返回前缀之后的剩余内容；不匹配返回 None。
+fn strip_ordered_item(s: &str) -> Option<&str> {
+    let digits_end = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits_end == 0 {
+        return None;
+    }
+    let rest = &s[digits_end..];
+    if let Some(after) = rest.strip_prefix(". ") {
+        Some(after)
+    } else if rest == "." {
+        Some("")
+    } else {
+        None
+    }
+}
+
+/// 处理行内标记：`code`、**bold**、*italic*/_italic_、~~del~~、[text](url)。
+/// 输入已是 HTML 转义后的文本。
+fn convert_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    let push_run = |out: &mut String, token: &str, content: &str, close: &str| {
+        out.push_str(token);
+        out.push_str(content);
+        out.push_str(close);
+    };
+
+    while i < n {
+        let c = chars[i];
+
+        // 行内代码 `...`：到下一个反引号为止，不做任何解析
+        if c == '`' {
+            if let Some(end) = chars[i + 1..].iter().position(|&ch| ch == '`') {
+                let content: String = chars[i + 1..i + 1 + end].iter().collect();
+                push_run(&mut out, "<code>", &content, "</code>");
+                i += end + 2;
+                continue;
+            }
+        }
+
+        // 粗体 **...** 或 __...__
+        if (c == '*' && i + 1 < n && chars[i + 1] == '*')
+            || (c == '_' && i + 1 < n && chars[i + 1] == '_')
+        {
+            let pair: String = std::iter::repeat(c).take(2).collect();
+            if let Some(end) = find_marker(&chars, i + 2, &pair) {
+                let content: String = chars[i + 2..end].iter().collect();
+                push_run(&mut out, "<b>", &content, "</b>");
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // 斜体 *...* 或 _..._（单个标记，需配对且标记两侧不都是空白）
+        if (c == '*' || c == '_') && (i + 1 < n && chars[i + 1] != c) {
+            // 左侧不能是字母数字（避免匹配 a*b 中的 *），右侧首个不能是空白
+            let left_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+            let right_ok = i + 1 < n && !chars[i + 1].is_whitespace();
+            if left_ok && right_ok {
+                if let Some(end) = find_single(&chars, i + 1, c) {
+                    let content: String = chars[i + 1..end].iter().collect();
+                    push_run(&mut out, "<i>", &content, "</i>");
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // 删除线 ~~...~~
+        if c == '~' && i + 1 < n && chars[i + 1] == '~' {
+            if let Some(end) = find_marker(&chars, i + 2, "~~") {
+                let content: String = chars[i + 2..end].iter().collect();
+                push_run(&mut out, "<s>", &content, "</s>");
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // 链接 [text](url) —— url 中的 & 已被转义成 &amp;，原样保留即可
+        if c == '[' {
+            if let Some(close_bracket) = chars[i + 1..].iter().position(|&ch| ch == ']') {
+                let after = i + 1 + close_bracket + 1;
+                if after < n && chars[after] == '(' {
+                    if let Some(close_paren) = chars[after + 1..].iter().position(|&ch| ch == ')') {
+                        let text: String = chars[i + 1..i + 1 + close_bracket].iter().collect();
+                        let url: String = chars[after + 1..after + 1 + close_paren].iter().collect();
+                        let inner = convert_inline(&text);
+                        out.push_str(&format!("<a href=\"{url}\">{inner}</a>"));
+                        i = after + 1 + close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 从 `from` 开始查找连续的 `marker`（如 "**"），返回其起始索引；找不到返回 None。
+fn find_marker(chars: &[char], from: usize, marker: &str) -> Option<usize> {
+    let m: Vec<char> = marker.chars().collect();
+    let ml = m.len();
+    if ml == 0 || from + ml > chars.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + ml <= chars.len() {
+        if chars[i..i + ml] == m[..] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 从 `from` 开始查找单个 `ch`，要求其后一个字符不是同一个（避免与 ** 混淆），
+/// 且标记本身不是单词内部的一部分。
+fn find_single(chars: &[char], from: usize, ch: char) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] == ch {
+            // 不能紧接另一个相同字符（那应该是 ** 的情况）
+            let next_is_same = i + 1 < chars.len() && chars[i + 1] == ch;
+            // 内容不能为空，且结束标记前一个字符不能是空白
+            let prev_not_ws = i > 0 && !chars[i - 1].is_whitespace();
+            if !next_is_same && prev_not_ws {
+                return Some(i);
+            }
+            // 跳过这对
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 async fn edit_text(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>, text: &str) {
     let Some(msg_id) = msg_id else { return };
     // Telegram 文本上限 4096，截断保护
     let safe: String = text.chars().take(4000).collect();
-    let _ = http
+    let html = md_to_tg_html(&safe);
+    // 先尝试 HTML 渲染；若被拒（解析失败）则回退纯文本，保证消息至少能发出
+    let resp = http
         .post(format!("{base}/editMessageText"))
-        .json(&json!({ "chat_id": chat_id, "message_id": msg_id, "text": safe }))
+        .json(&json!({ "chat_id": chat_id, "message_id": msg_id, "text": html, "parse_mode": "HTML" }))
         .send()
         .await;
+    if let Ok(r) = resp {
+        let ok = r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+            .unwrap_or(false);
+        if !ok {
+            let _ = http
+                .post(format!("{base}/editMessageText"))
+                .json(&json!({ "chat_id": chat_id, "message_id": msg_id, "text": safe }))
+                .send()
+                .await;
+        }
+    }
 }
 
 /// 把事件流渲染到指定占位消息（沿用节流编辑策略）。

@@ -36,6 +36,44 @@ pub enum AgentEvent {
     ContinuePrompt(String),
 }
 
+/// 把所有 `mcp__` 前缀的工具汇总成一段「可用工具」清单，连同通用使用引导
+/// 一起追加到 system message。新增/移除 MCP server 自动反映，无需改文档。
+/// 没有 MCP 工具时返回空串（不污染 system message）。
+fn build_mcp_summary(tools: &ToolMap) -> String {
+    let mut names: Vec<&String> = tools.keys().filter(|n| n.starts_with("mcp__")).collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort();
+    let listing = names
+        .iter()
+        .map(|n| {
+            let desc = tools
+                .get(*n)
+                .map(|t| t.description())
+                .unwrap_or("")
+                .trim();
+            if desc.is_empty() {
+                format!("- `{n}`")
+            } else {
+                // description 可能多行，压成一行避免破坏清单结构
+                let one_line = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("- `{n}`：{one_line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\n\n## MCP 工具（可用清单 + 使用准则）\n\
+以下是以 `mcp__` 开头的外部能力工具（联网、浏览器、数据库等），按各自描述提供能力：\n\n\
+{listing}\n\n\
+**通用准则**：当用户的请求落在某个工具的能力范围内时，主动调用它——不要凭自身记忆回答\
+需要实时/外部数据的问题（如最新资讯、网页内容、外部系统数据），也不要反问「要不要用某工具」。\
+按工具描述判断是否匹配即可。"
+    )
+}
+
 impl Agent {
     pub fn new(
         cfg: LlmConfig,
@@ -44,6 +82,8 @@ impl Agent {
         long_term: Option<LongTermMemory>,
         top_k: usize,
     ) -> Self {
+        let mut persona = persona;
+        persona.push_str(&build_mcp_summary(&tools));
         Self {
             cfg,
             tools,

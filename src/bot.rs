@@ -29,6 +29,11 @@ struct Chat {
     id: i64,
 }
 
+/// 超时挂起的上下文：用户选择继续则沿用此 msg_id 编辑占位消息。
+struct TimeoutCtx {
+    msg_id: Option<i64>,
+}
+
 const TG_API: &str = "https://api.telegram.org";
 /// 单条消息处理超时：超时后向用户报错，避免占位消息无限停在「…」。
 const CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -51,6 +56,9 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     // chat_id → 正在等待用户确认是否续跑的占位消息 id。下一条消息为肯定词则续跑，
     // 否则视作新输入。
     let pending_continue: Arc<Mutex<HashMap<i64, i64>>> = Arc::new(Mutex::new(HashMap::new()));
+    // chat_id → 处理超时后挂起、等待用户选择「继续/终止」的上下文。
+    // 下一条消息为 "1" 则用 continue_stream 续跑；"2" 则终止。
+    let pending_timeout: Arc<Mutex<HashMap<i64, TimeoutCtx>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
@@ -157,6 +165,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     "new" | "clear" => {
                         let removed = agents.lock().await.remove(&chat_id).is_some();
                         pending_continue.lock().await.remove(&chat_id);
+                        pending_timeout.lock().await.remove(&chat_id);
                         let reply = if removed {
                             "✅ 已开启新会话，上下文已清空。"
                         } else {
@@ -217,6 +226,60 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             // 先取走待续跑确认状态（若上一轮耗尽）
             let pending_msg_id = pending_continue.lock().await.remove(&chat_id);
 
+            // 超时选择分支：上一轮处理超时挂起，用户回复 "1"(继续) / "2"(终止)
+            if let Some(tc) = pending_timeout.lock().await.remove(&chat_id) {
+                match text.trim() {
+                    "1" => {
+                        // 继续等待：用 continue_stream 接着已有历史跑，仍受超时保护
+                        let timeout_fut = async {
+                            let mut map = agents.lock().await;
+                            let agent = map.get_mut(&chat_id).unwrap();
+                            let events = agent.continue_stream().await?;
+                            let (buf, pending) =
+                                render_events(&http, &base, chat_id, tc.msg_id, events).await;
+                            if pending {
+                                if let Some(id) = tc.msg_id {
+                                    pending_continue.lock().await.insert(chat_id, id);
+                                }
+                            } else {
+                                edit_text(&http, &base, chat_id, tc.msg_id, &buf).await;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        };
+                        match tokio::time::timeout(CHAT_TIMEOUT, timeout_fut).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                report_error(&http, &base, chat_id, tc.msg_id, &e.to_string()).await;
+                            }
+                            Err(_elapsed) => {
+                                // 再次超时：同样询问，循环可重复
+                                let mid = tc.msg_id;
+                                pending_timeout.lock().await.insert(chat_id, tc);
+                                let ask = "⏳ 仍在处理中（再次超过 3 分钟）。\n\n1️⃣ 继续等待\n2️⃣ 终止";
+                                edit_text(&http, &base, chat_id, mid, ask).await;
+                            }
+                        }
+                        continue;
+                    }
+                    "2" => {
+                        // 终止：编辑占位消息为终止提示（agent 状态保留，用户可 /new 清空）
+                        edit_text(
+                            &http,
+                            &base,
+                            chat_id,
+                            tc.msg_id,
+                            "🛑 已终止本次处理。",
+                        )
+                        .await;
+                        continue;
+                    }
+                    _ => {
+                        // 非数字：放弃超时上下文，按新输入正常处理
+                        // （把 tc 丢弃）
+                    }
+                }
+            }
+
             // 占位消息 id 的外层副本：处理 future 内部获取后写入，超时被 drop 时
             // 外层仍可据此编辑那条停在「…」的消息。
             let msg_slot: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
@@ -276,24 +339,39 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
             let result: Result<(), anyhow::Error> =
                 match tokio::time::timeout(CHAT_TIMEOUT, timeout_fut).await {
                     Ok(r) => r,
-                    Err(_elapsed) => Err(anyhow::anyhow!(
-                        "处理超时（超过 3 分钟未收到回复）。原因可能是：模型/工具调用卡住、网络中断、或任务过于复杂。请重试或换个问法。"
-                    )),
+                    Err(_elapsed) => {
+                        // 超时：不直接终止，而是询问用户是否继续等待或终止。
+                        // 释放 agents 锁（future 被 drop），把上下文存入 pending_timeout，
+                        // 等用户回复 "1"(继续) / "2"(终止)。Agent 的对话状态保留在 history 里，
+                        // 续跑时用 continue_stream 从已有历史接着跑。
+                        let slot_id = msg_slot.lock().await.clone();
+                        let mid = slot_id.or(pending_msg_id);
+                        pending_timeout.lock().await.insert(
+                            chat_id,
+                            TimeoutCtx { msg_id: mid },
+                        );
+                        let ask = "⏰ 处理已超过 3 分钟仍未完成。\n\n回复数字选择：\n\
+1️⃣ 继续等待\n\
+2️⃣ 终止本次处理";
+                        match mid {
+                            Some(id) => {
+                                let _ = edit_text(&http, &base, chat_id, Some(id), ask).await;
+                            }
+                            None => {
+                                let _ = http
+                                    .post(format!("{base}/sendMessage"))
+                                    .json(&json!({ "chat_id": chat_id, "text": ask, "parse_mode": "HTML" }))
+                                    .send()
+                                    .await;
+                            }
+                        }
+                        continue; // 本轮结束，等用户下一条消息做选择
+                    }
                 };
 
             if let Err(e) = result {
-                // 优先复用已写出的占位消息 id 编辑它；否则回退到续跑占位 id；都没有就新发一条
                 let slot_id = msg_slot.lock().await.clone();
-                if let Some(msg_id) = slot_id.or(pending_msg_id) {
-                    let _ =
-                        edit_text(&http, &base, chat_id, Some(msg_id), &format!("[错误] {e}")).await;
-                } else {
-                    let _ = http
-                        .post(format!("{base}/sendMessage"))
-                        .json(&json!({ "chat_id": chat_id, "text": format!("[错误] {e}"), "parse_mode": "HTML" }))
-                        .send()
-                        .await;
-                }
+                report_error(&http, &base, chat_id, slot_id.or(pending_msg_id), &e.to_string()).await;
             }
         }
     }
@@ -544,6 +622,25 @@ fn find_single(chars: &[char], from: usize, ch: char) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// 统一的错误反馈：优先编辑已知占位消息，否则新发一条。
+async fn report_error(
+    http: &Client,
+    base: &str,
+    chat_id: i64,
+    msg_id: Option<i64>,
+    msg: &str,
+) {
+    if let Some(id) = msg_id {
+        let _ = edit_text(http, base, chat_id, Some(id), &format!("[错误] {msg}")).await;
+    } else {
+        let _ = http
+            .post(format!("{base}/sendMessage"))
+            .json(&json!({ "chat_id": chat_id, "text": format!("[错误] {msg}"), "parse_mode": "HTML" }))
+            .send()
+            .await;
+    }
 }
 
 async fn edit_text(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>, text: &str) {

@@ -514,10 +514,59 @@ async fn edit_text(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>,
     }
 }
 
+/// 工具名简化：`mcp__server__tool` → `server__tool`；内置工具无前缀，原样返回。
+fn short_tool_name(name: &str) -> String {
+    name.strip_prefix("mcp__").unwrap_or(name).to_string()
+}
+
+/// 从工具调用的 JSON 参数里提取一个人类可读的摘要。
+/// 按字段优先级查找常见字段；找不到则回退到截断的原始 JSON。
+fn summarize_args(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return "(无参数)".to_string();
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return truncate_chars(trimmed, 80);
+    };
+    let keys = [
+        "url", "command", "query", "text", "prompt", "message", "name", "file_path", "selector",
+        "path", "skill",
+    ];
+    if let Some(obj) = v.as_object() {
+        for key in keys {
+            if let Some(val) = obj.get(key).and_then(|x| x.as_str()) {
+                if !val.is_empty() {
+                    return truncate_chars(val, 80);
+                }
+            }
+        }
+    }
+    // 没匹配到已知字段：显示截断后的紧凑 JSON
+    let compact = serde_json::to_string(&v).unwrap_or_else(|_| trimmed.to_string());
+    truncate_chars(&compact, 60)
+}
+
+/// 按字符数（非字节）截断，避免切断多字节 UTF-8。
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// 把正文与操作日志拼成待显示的文本。操作日志为空时只返回正文。
+fn compose_display(buf: &str, tool_log: &str) -> String {
+    if tool_log.is_empty() {
+        return buf.to_string();
+    }
+    let sep = if buf.is_empty() { "" } else { "\n\n" };
+    format!("{buf}{sep}🔧 操作中\n{tool_log}")
+}
+
 /// 把事件流渲染到指定占位消息（沿用节流编辑策略）。
 /// 返回 `(最终文本, 是否以 ContinuePrompt 结束)`。
-/// - 节流：每攒够 ~120 字符编辑一次。
-/// - `Final` 覆盖 buf；`ContinuePrompt` 追加提示语并立即编辑一次，返回 `pending=true`。
+/// - 正文 `Text` 增量：节流编辑（攒够 ~120 字符）。
+/// - `ToolCall`/`ToolError`：追加到操作日志并立即编辑（工具调用值得即时可见）。
+/// - `Final`：用最终答复覆盖 buf，并清空操作日志（过程信息退场）。
+/// - `ContinuePrompt`：追加提示语并立即编辑一次，返回 `pending=true`。
 async fn render_events(
     http: &Client,
     base: &str,
@@ -527,6 +576,7 @@ async fn render_events(
 ) -> (String, bool) {
     let mut buf = String::new();
     let mut last_len = 0;
+    let mut tool_log = String::new();
     let mut pending = false;
     for ev in events {
         match ev {
@@ -534,21 +584,43 @@ async fn render_events(
                 buf.push_str(&t);
                 if buf.len().saturating_sub(last_len) >= 120 {
                     last_len = buf.len();
-                    edit_text(http, base, chat_id, msg_id, &buf).await;
+                    let display = compose_display(&buf, &tool_log);
+                    edit_text(http, base, chat_id, msg_id, &display).await;
                 }
+            }
+            AgentEvent::ToolCall { name, args } => {
+                if !tool_log.is_empty() {
+                    tool_log.push('\n');
+                }
+                tool_log.push_str(&format!(
+                    "• {} → {}",
+                    short_tool_name(&name),
+                    summarize_args(&args)
+                ));
+                let display = compose_display(&buf, &tool_log);
+                edit_text(http, base, chat_id, msg_id, &display).await;
+            }
+            AgentEvent::ToolError(msg) => {
+                if !tool_log.is_empty() {
+                    tool_log.push('\n');
+                }
+                tool_log.push_str(&format!("• ⚠️ {}", truncate_chars(&msg, 80)));
+                let display = compose_display(&buf, &tool_log);
+                edit_text(http, base, chat_id, msg_id, &display).await;
             }
             AgentEvent::Final(t) => {
                 buf = t;
+                tool_log.clear();
             }
             AgentEvent::ContinuePrompt(note) => {
                 if !buf.is_empty() {
                     buf.push_str("\n\n");
                 }
                 buf.push_str(&note);
-                edit_text(http, base, chat_id, msg_id, &buf).await;
+                let display = compose_display(&buf, &tool_log);
+                edit_text(http, base, chat_id, msg_id, &display).await;
                 pending = true;
             }
-            _ => {}
         }
     }
     (buf, pending)

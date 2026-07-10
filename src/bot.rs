@@ -147,6 +147,48 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 continue;
             }
 
+            // 斜杠命令（以 / 开头）：管理会话本身，不进 Agent 上下文
+            let cmd = text.trim();
+            if let Some(rest) = cmd.strip_prefix('/') {
+                let cmd_name = rest.split_whitespace().next().unwrap_or("");
+                match cmd_name {
+                    "new" | "clear" => {
+                        let removed = agents.lock().await.remove(&chat_id).is_some();
+                        pending_continue.lock().await.remove(&chat_id);
+                        let reply = if removed {
+                            "✅ 已开启新会话，上下文已清空。"
+                        } else {
+                            "（当前本就是新会话，无需清空。）"
+                        };
+                        let _ = http
+                            .post(format!("{base}/sendMessage"))
+                            .json(&json!({ "chat_id": chat_id, "text": reply, "parse_mode": "HTML" }))
+                            .send()
+                            .await;
+                    }
+                    "help" | "start" => {
+                        let help = "<b>命令</b>\n\
+/new · /clear — 开启新会话，清空当前上下文\n\
+/help — 显示本帮助\n\n\
+直接发消息即可对话。长期记忆跨会话保留。";
+                        let _ = http
+                            .post(format!("{base}/sendMessage"))
+                            .json(&json!({ "chat_id": chat_id, "text": help, "parse_mode": "HTML" }))
+                            .send()
+                            .await;
+                    }
+                    _ => {
+                        let reply = format!("未知命令 /{cmd_name}。发送 /help 查看可用命令。");
+                        let _ = http
+                            .post(format!("{base}/sendMessage"))
+                            .json(&json!({ "chat_id": chat_id, "text": reply }))
+                            .send()
+                            .await;
+                    }
+                }
+                continue;
+            }
+
             // 取/建该 chat 的 Agent
             {
                 let mut map = agents.lock().await;

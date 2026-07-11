@@ -325,11 +325,14 @@ impl ChatActor {
     /// 超时时编辑占位消息为询问，并设置 `pending_timeout` 状态。
     async fn process(&mut self, msg_id: Option<i64>, new_input: Option<&str>) {
         let chat_id = self.chat_id;
+        let started = std::time::Instant::now();
+        tracing::info!("chat {} 开始处理, msg_id={:?}", chat_id, msg_id);
         let result = tokio::time::timeout(
             CHAT_TIMEOUT,
             self.process_inner(msg_id, chat_id, new_input),
         )
         .await;
+        tracing::info!("chat {} 处理结束, 耗时 {:?}", chat_id, started.elapsed());
 
         match result {
             Ok(Ok(())) => {}
@@ -338,11 +341,23 @@ impl ChatActor {
             }
             Err(_elapsed) => {
                 // 超时：询问用户继续/终止，设置挂起状态
+                tracing::warn!("chat {} 处理超时，msg_id={:?}", chat_id, msg_id);
                 self.pending_timeout = msg_id;
                 let ask = "⏰ 处理已超过 3 分钟仍未完成。\n\n回复数字选择：\n\
 1️⃣ 继续等待\n\
 2️⃣ 终止本次处理";
-                edit_text(&self.http, &self.base, chat_id, msg_id, ask).await;
+                // msg_id 为 None（占位消息没发成功）时 edit_text 会静默返回；
+                // 改用 sendMessage 保底，确保超时提示一定发得出。
+                if let Some(id) = msg_id {
+                    edit_text(&self.http, &self.base, chat_id, Some(id), ask).await;
+                } else {
+                    let _ = self
+                        .http
+                        .post(format!("{}/sendMessage", self.base))
+                        .json(&json!({ "chat_id": chat_id, "text": ask }))
+                        .send()
+                        .await;
+                }
             }
         }
     }

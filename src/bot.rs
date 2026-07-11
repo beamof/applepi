@@ -29,11 +29,6 @@ struct Chat {
     id: i64,
 }
 
-/// 超时挂起的上下文：用户选择继续则沿用此 msg_id 编辑占位消息。
-struct TimeoutCtx {
-    msg_id: Option<i64>,
-}
-
 const TG_API: &str = "https://api.telegram.org";
 /// 单条消息处理超时：超时后向用户报错，避免占位消息无限停在「…」。
 const CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -51,15 +46,6 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     let http = Client::new();
     let base = format!("{TG_API}/bot{token}");
 
-    // 每个 chat_id 一个独立 Agent（独立记忆上下文）
-    let agents: Arc<Mutex<HashMap<i64, Agent>>> = Arc::new(Mutex::new(HashMap::new()));
-    // chat_id → 正在等待用户确认是否续跑的占位消息 id。下一条消息为肯定词则续跑，
-    // 否则视作新输入。
-    let pending_continue: Arc<Mutex<HashMap<i64, i64>>> = Arc::new(Mutex::new(HashMap::new()));
-    // chat_id → 处理超时后挂起、等待用户选择「继续/终止」的上下文。
-    // 下一条消息为 "1" 则用 continue_stream 续跑；"2" 则终止。
-    let pending_timeout: Arc<Mutex<HashMap<i64, TimeoutCtx>>> = Arc::new(Mutex::new(HashMap::new()));
-
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
     let mut persona = crate::config::load_persona("AGENTS.md")?;
@@ -75,7 +61,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
         None
     };
     // 注意：long_term 内含 Mutex<Connection>，跨 agent 共享需 Arc。
-    // 这里为简化，每个 agent 重新 open 一份（SQLite 多连接没问题）。
+    // 这里为简化，每个 actor 重新 open 一份（SQLite 多连接没问题）。
     drop(long_term);
 
     // Cron scheduler：仅当启用时启动。watch 通道用于 agent 通过 cron 工具改动后通知重载。
@@ -105,7 +91,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
         None
     };
 
-    // 合并默认工具 + MCP 远端工具 + Cron 管理工具（启动时一次性构建，每个 chat 共享同一份）
+    // 合并默认工具 + MCP 远端工具 + Cron 管理工具（启动时一次性构建，每个 actor 共享同一份）
     let mut tools = crate::tools::default_tools();
     tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
     if let Some(store) = &cron_store {
@@ -118,6 +104,23 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
         tools.insert(t.name().to_string(), t);
     }
     let top_k = cfg.memory.top_k_or(3);
+
+    // 构建新 actor 所需的共享上下文（Clone 便宜：全是 Arc）
+    let ctx = Arc::new(ChatCtx {
+        llm_cfg,
+        embed_cfg,
+        persona,
+        tools,
+        cfg: cfg.clone(),
+        top_k,
+        http: http.clone(),
+        base: base.clone(),
+    });
+
+    // 每个 chat_id 一个独立 actor task（拥有自己的 Agent，互不阻塞）。
+    // 主循环只负责 getUpdates + 派发，绝不 await LLM 调用。
+    let actors: Arc<Mutex<HashMap<i64, ChatHandle>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let mut offset: Option<i64> = None;
     tracing::info!("Telegram bot 已启动，开始长轮询...");
@@ -157,16 +160,14 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 continue;
             }
 
-            // 斜杠命令（以 / 开头）：管理会话本身，不进 Agent 上下文
-            let cmd = text.trim();
-            if let Some(rest) = cmd.strip_prefix('/') {
+            // 斜杠命令在主循环直接处理（轻量、不涉及 LLM），/new 会重建 actor
+            if let Some(rest) = text.trim().strip_prefix('/') {
                 let cmd_name = rest.split_whitespace().next().unwrap_or("");
                 match cmd_name {
                     "new" | "clear" => {
-                        let removed = agents.lock().await.remove(&chat_id).is_some();
-                        pending_continue.lock().await.remove(&chat_id);
-                        pending_timeout.lock().await.remove(&chat_id);
-                        let reply = if removed {
+                        // 中止旧 actor（若有）并移除，下一条消息自然触发新建
+                        let had = actors.lock().await.remove(&chat_id).is_some();
+                        let reply = if had {
                             "✅ 已开启新会话，上下文已清空。"
                         } else {
                             "（当前本就是新会话，无需清空。）"
@@ -200,181 +201,187 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                 continue;
             }
 
-            // 取/建该 chat 的 Agent
-            {
-                let mut map = agents.lock().await;
-                map.entry(chat_id).or_insert_with(|| {
-                    let lt = if cfg.memory.enabled {
-                        crate::memory::long_term::LongTermMemory::open(
-                            &cfg.memory.db_path,
-                            embed_cfg.clone(),
-                        )
-                        .ok()
-                    } else {
-                        None
-                    };
-                    Agent::new(
-                        llm_cfg.clone(),
-                        persona.clone(),
-                        tools.clone(),
-                        lt,
-                        top_k,
-                    )
-                });
-            }
-
-            // 先取走待续跑确认状态（若上一轮耗尽）
-            let pending_msg_id = pending_continue.lock().await.remove(&chat_id);
-
-            // 超时选择分支：上一轮处理超时挂起，用户回复 "1"(继续) / "2"(终止)
-            if let Some(tc) = pending_timeout.lock().await.remove(&chat_id) {
-                match text.trim() {
-                    "1" => {
-                        // 继续等待：用 continue_stream 接着已有历史跑，仍受超时保护
-                        let timeout_fut = async {
-                            let mut map = agents.lock().await;
-                            let agent = map.get_mut(&chat_id).unwrap();
-                            let events = agent.continue_stream().await?;
-                            let (buf, pending) =
-                                render_events(&http, &base, chat_id, tc.msg_id, events).await;
-                            if pending {
-                                if let Some(id) = tc.msg_id {
-                                    pending_continue.lock().await.insert(chat_id, id);
-                                }
-                            } else {
-                                edit_text(&http, &base, chat_id, tc.msg_id, &buf).await;
-                            }
-                            Ok::<(), anyhow::Error>(())
-                        };
-                        match tokio::time::timeout(CHAT_TIMEOUT, timeout_fut).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                report_error(&http, &base, chat_id, tc.msg_id, &e.to_string()).await;
-                            }
-                            Err(_elapsed) => {
-                                // 再次超时：同样询问，循环可重复
-                                let mid = tc.msg_id;
-                                pending_timeout.lock().await.insert(chat_id, tc);
-                                let ask = "⏳ 仍在处理中（再次超过 3 分钟）。\n\n1️⃣ 继续等待\n2️⃣ 终止";
-                                edit_text(&http, &base, chat_id, mid, ask).await;
-                            }
-                        }
-                        continue;
-                    }
-                    "2" => {
-                        // 终止：编辑占位消息为终止提示（agent 状态保留，用户可 /new 清空）
-                        edit_text(
-                            &http,
-                            &base,
-                            chat_id,
-                            tc.msg_id,
-                            "🛑 已终止本次处理。",
-                        )
-                        .await;
-                        continue;
-                    }
-                    _ => {
-                        // 非数字：放弃超时上下文，按新输入正常处理
-                        // （把 tc 丢弃）
-                    }
-                }
-            }
-
-            // 占位消息 id 的外层副本：处理 future 内部获取后写入，超时被 drop 时
-            // 外层仍可据此编辑那条停在「…」的消息。
-            let msg_slot: std::sync::Arc<tokio::sync::Mutex<Option<i64>>> =
-                std::sync::Arc::new(tokio::sync::Mutex::new(None));
-
-            let timeout_fut = async {
-                let mut map = agents.lock().await;
-                let agent = map.get_mut(&chat_id).unwrap();
-
-                // 续跑确认分支：上一轮耗尽，用户回复肯定词则继续（沿用原占位消息）
-                if let Some(msg_id) = pending_msg_id {
-                    if is_affirmative(&text) {
-                        let events = agent.continue_stream().await?;
-                        let (buf, pending) =
-                            render_events(&http, &base, chat_id, Some(msg_id), events).await;
-                        if pending {
-                            pending_continue.lock().await.insert(chat_id, msg_id);
-                        } else {
-                            edit_text(&http, &base, chat_id, Some(msg_id), &buf).await;
-                        }
-                        return Ok(());
-                    }
-                    // 非肯定词 → 放弃续跑，按新输入处理
-                }
-
-                // 正常新输入：先发一条占位消息，后续逐段编辑更新（流式体验）
-                let placeholder = http
-                    .post(format!("{base}/sendMessage"))
-                    .json(&json!({ "chat_id": chat_id, "text": "…", "parse_mode": "HTML" }))
-                    .send()
-                    .await?
-                    .json::<serde_json::Value>()
-                    .await?;
-                let msg_id = placeholder
-                    .get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(|v| v.as_i64());
-                if let Some(id) = msg_id {
-                    *msg_slot.lock().await = Some(id);
-                }
-
-                // 把当前 chat_id 注入上下文，供 cron 等工具使用（用户无需手动提供）
-                let input = format!("[chat_id: {chat_id}]\n\n{text}");
-                let events = agent.chat_stream(&input).await?;
-                let (buf, pending) = render_events(&http, &base, chat_id, msg_id, events).await;
-                if pending {
-                    // 耗尽：挂起等待用户确认，不做最终编辑（消息已显示提问）
-                    if let Some(id) = msg_id {
-                        pending_continue.lock().await.insert(chat_id, id);
-                    }
-                } else {
-                    edit_text(&http, &base, chat_id, msg_id, &buf).await;
-                }
-                Ok(())
+            // 取/建该 chat 的 actor，把消息送进去（非阻塞：channel send 即返回）
+            let handle = {
+                let mut map = actors.lock().await;
+                map.entry(chat_id)
+                    .or_insert_with(|| ChatActor::spawn(chat_id, ctx.clone()))
+                    .clone()
             };
+            // channel 满则丢弃消息（actor 正忙；Telegram 侧用户会看到无响应，但不会冻结其他 chat）
+            let _ = handle.tx.try_send(text);
+        }
+    }
+}
 
-            let result: Result<(), anyhow::Error> =
-                match tokio::time::timeout(CHAT_TIMEOUT, timeout_fut).await {
-                    Ok(r) => r,
-                    Err(_elapsed) => {
-                        // 超时：不直接终止，而是询问用户是否继续等待或终止。
-                        // 释放 agents 锁（future 被 drop），把上下文存入 pending_timeout，
-                        // 等用户回复 "1"(继续) / "2"(终止)。Agent 的对话状态保留在 history 里，
-                        // 续跑时用 continue_stream 从已有历史接着跑。
-                        let slot_id = msg_slot.lock().await.clone();
-                        let mid = slot_id.or(pending_msg_id);
-                        pending_timeout.lock().await.insert(
-                            chat_id,
-                            TimeoutCtx { msg_id: mid },
-                        );
-                        let ask = "⏰ 处理已超过 3 分钟仍未完成。\n\n回复数字选择：\n\
+// ---------- per-chat actor ----------
+
+/// 构建新 actor 所需的共享上下文。所有字段 Clone 便宜（Arc 或已 Clone 的配置）。
+struct ChatCtx {
+    llm_cfg: crate::llm::LlmConfig,
+    embed_cfg: crate::memory::long_term::EmbedConfig,
+    persona: String,
+    tools: crate::tools::ToolMap,
+    cfg: Config,
+    top_k: usize,
+    http: Client,
+    base: String,
+}
+
+/// 主循环持有的 actor 句柄。Clone = 共享同一个 actor。
+#[derive(Clone)]
+struct ChatHandle {
+    tx: tokio::sync::mpsc::Sender<String>,
+    _task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+/// actor 内部状态：一个 Agent + 续跑/超时交互的挂起状态。
+struct ChatActor {
+    chat_id: i64,
+    agent: Agent,
+    http: Client,
+    base: String,
+    /// 续跑确认：上一轮耗尽，等用户肯定词继续
+    pending_continue: Option<i64>,
+    /// 超时询问：等用户回复 "1"(继续) / "2"(终止)
+    pending_timeout: Option<i64>,
+}
+
+impl ChatActor {
+    fn spawn(chat_id: i64, ctx: Arc<ChatCtx>) -> ChatHandle {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let lt = if ctx.cfg.memory.enabled {
+            crate::memory::long_term::LongTermMemory::open(
+                &ctx.cfg.memory.db_path,
+                ctx.embed_cfg.clone(),
+            )
+            .ok()
+        } else {
+            None
+        };
+        let agent = Agent::new(
+            ctx.llm_cfg.clone(),
+            ctx.persona.clone(),
+            ctx.tools.clone(),
+            lt,
+            ctx.top_k,
+        );
+        let mut actor = ChatActor {
+            chat_id,
+            agent,
+            http: ctx.http.clone(),
+            base: ctx.base.clone(),
+            pending_continue: None,
+            pending_timeout: None,
+        };
+        let task = tokio::spawn(async move {
+            while let Some(text) = rx.recv().await {
+                actor.handle_message(text).await;
+            }
+        });
+        ChatHandle {
+            tx,
+            _task: Arc::new(task),
+        }
+    }
+
+    /// 处理一条用户消息。串行调用（actor 单线程），所有交互状态都在 self 上。
+    async fn handle_message(&mut self, text: String) {
+        // 1) 超时询问待回应
+        if let Some(msg_id) = self.pending_timeout.take() {
+            match text.trim() {
+                "1" => {
+                    // 继续等待：continue_stream 接着已有历史跑，仍受超时保护
+                    self.process(Some(msg_id), None).await;
+                    return;
+                }
+                "2" => {
+                    edit_text(&self.http, &self.base, self.chat_id, Some(msg_id), "🛑 已终止本次处理。").await;
+                    return;
+                }
+                _ => {
+                    // 非数字：放弃超时上下文，按新输入正常处理
+                }
+            }
+        }
+
+        // 2) 续跑确认待回应
+        if let Some(msg_id) = self.pending_continue.take() {
+            if is_affirmative(&text) {
+                self.process(Some(msg_id), None).await;
+                return;
+            }
+            // 非肯定词 → 放弃续跑，按新输入处理
+        }
+
+        // 3) 正常新输入：发占位消息后处理
+        let msg_id = send_placeholder(&self.http, &self.base, self.chat_id).await;
+        self.process(msg_id, Some(&text)).await;
+    }
+
+    /// 执行一次 agent 处理，带超时保护。
+    /// - `new_input = Some(text)`：正常新对话（构造 `[chat_id:..]\n\n{text}` 喂给 agent）
+    /// - `new_input = None`：续跑（continue_stream，沿用已有历史，用于超时选"继续"和续跑确认）
+    /// 超时时编辑占位消息为询问，并设置 `pending_timeout` 状态。
+    async fn process(&mut self, msg_id: Option<i64>, new_input: Option<&str>) {
+        let chat_id = self.chat_id;
+        let result = tokio::time::timeout(
+            CHAT_TIMEOUT,
+            self.process_inner(msg_id, chat_id, new_input),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                report_error(&self.http, &self.base, chat_id, msg_id, &e.to_string()).await;
+            }
+            Err(_elapsed) => {
+                // 超时：询问用户继续/终止，设置挂起状态
+                self.pending_timeout = msg_id;
+                let ask = "⏰ 处理已超过 3 分钟仍未完成。\n\n回复数字选择：\n\
 1️⃣ 继续等待\n\
 2️⃣ 终止本次处理";
-                        match mid {
-                            Some(id) => {
-                                let _ = edit_text(&http, &base, chat_id, Some(id), ask).await;
-                            }
-                            None => {
-                                let _ = http
-                                    .post(format!("{base}/sendMessage"))
-                                    .json(&json!({ "chat_id": chat_id, "text": ask, "parse_mode": "HTML" }))
-                                    .send()
-                                    .await;
-                            }
-                        }
-                        continue; // 本轮结束，等用户下一条消息做选择
-                    }
-                };
-
-            if let Err(e) = result {
-                let slot_id = msg_slot.lock().await.clone();
-                report_error(&http, &base, chat_id, slot_id.or(pending_msg_id), &e.to_string()).await;
+                edit_text(&self.http, &self.base, chat_id, msg_id, ask).await;
             }
         }
     }
+
+    /// 实际的 agent 调用 + 渲染。被 `process` 包裹超时。
+    async fn process_inner(
+        &mut self,
+        msg_id: Option<i64>,
+        chat_id: i64,
+        new_input: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let events = if let Some(text) = new_input {
+            let input = format!("[chat_id: {chat_id}]\n\n{text}");
+            self.agent.chat_stream(&input).await?
+        } else {
+            self.agent.continue_stream().await?
+        };
+        let (buf, pending) = render_events(&self.http, &self.base, chat_id, msg_id, events).await;
+        if pending {
+            self.pending_continue = msg_id;
+        } else {
+            edit_text(&self.http, &self.base, chat_id, msg_id, &buf).await;
+        }
+        Ok(())
+    }
+}
+
+/// 发送占位消息，返回 message_id。
+async fn send_placeholder(http: &Client, base: &str, chat_id: i64) -> Option<i64> {
+    let resp = http
+        .post(format!("{base}/sendMessage"))
+        .json(&json!({ "chat_id": chat_id, "text": "…", "parse_mode": "HTML" }))
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v.get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|m| m.as_i64())
 }
 
 /// 把常见 markdown 转成 Telegram 支持的 HTML 子集。

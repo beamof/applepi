@@ -15,7 +15,4 @@ impl History {
     pub fn all(&self) -> &[Message] {
         &self.msgs
     }
-    pub fn system_mut(&mut self) -> Option<&mut Message> {
-        self.msgs.first_mut()
-    }
 }

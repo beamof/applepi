@@ -98,8 +98,14 @@ impl Agent {
     /// 流式对话。返回事件流。
     pub async fn chat_stream(&mut self, input: &str) -> Result<Vec<AgentEvent>> {
         self.last_input = Some(input.to_string());
-        self.recall_and_inject(input).await;
-        self.history.add(Message::user(input));
+        // 长期记忆拼到当前 user 消息尾部（而非注入 system），保持 system 消息稳定、
+        // 最大化 prompt 前缀缓存命中。
+        let memory_block = self.recall(input).await;
+        let user_msg = match memory_block {
+            Some(m) => format!("{input}\n\n{m}"),
+            None => input.to_string(),
+        };
+        self.history.add(Message::user(user_msg));
         self.turn_loop().await
     }
 
@@ -206,10 +212,10 @@ impl Agent {
         Ok(out)
     }
 
-    async fn recall_and_inject(&mut self, input: &str) {
-        let Some(mem) = self.long_term.as_ref() else {
-            return;
-        };
+    /// 检索长期记忆，命中则返回格式化文本块，供调用方拼入当前 user 消息。
+    /// 不再写入 system 消息，以保持 system 稳定、提高 prompt 前缀缓存命中率。
+    async fn recall(&self, input: &str) -> Option<String> {
+        let mem = self.long_term.as_ref()?;
         match mem.recall(input, self.top_k).await {
             Ok(hits) if !hits.is_empty() => {
                 let block = hits
@@ -217,16 +223,9 @@ impl Agent {
                     .map(|h| format!("- {h}"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let note = format!("\n\n[长期记忆]\n{block}");
-                if let Some(sys) = self.history.system_mut() {
-                    // 末尾追加，避免覆盖 persona
-                    sys.content = Some(format!(
-                        "{}{note}",
-                        sys.content.clone().unwrap_or_default()
-                    ));
-                }
+                Some(format!("[长期记忆]\n{block}"))
             }
-            _ => {}
+            _ => None,
         }
     }
 

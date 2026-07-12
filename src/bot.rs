@@ -377,6 +377,12 @@ impl ChatActor {
             self.agent.continue_stream().await?
         };
         let (buf, pending) = render_events(&self.http, &self.base, chat_id, msg_id, events).await;
+        // 静默输出：agent 用 [SILENT] 标记（开头或结尾）表示这条回复不发往用户。
+        // 删除开头的占位消息，避免留下一句「…」。
+        if is_silent(&buf) {
+            delete_message(&self.http, &self.base, chat_id, msg_id).await;
+            return Ok(());
+        }
         if pending {
             self.pending_continue = msg_id;
         } else {
@@ -664,6 +670,23 @@ async fn report_error(
             .send()
             .await;
     }
+}
+
+/// 判断一条回复是否标记为静默（不发送给用户）。
+/// agent 在回复开头或结尾加 `[SILENT]` 即触发。
+fn is_silent(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("[SILENT]") || t.ends_with("[SILENT]")
+}
+
+/// 删除指定消息（用于静默输出时清掉占位消息）。失败静默忽略。
+async fn delete_message(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>) {
+    let Some(msg_id) = msg_id else { return };
+    let _ = http
+        .post(format!("{base}/deleteMessage"))
+        .json(&json!({ "chat_id": chat_id, "message_id": msg_id }))
+        .send()
+        .await;
 }
 
 async fn edit_text(http: &Client, base: &str, chat_id: i64, msg_id: Option<i64>, text: &str) {

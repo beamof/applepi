@@ -8,6 +8,13 @@ use crate::tools::ToolMap;
 
 pub const MAX_TURNS: usize = 64;
 
+/// 判断一条 agent 回复是否标记为静默（不应推送给用户）。
+/// agent 在回复开头或结尾加 `[SILENT]` 即触发，调用方据此跳过发送。
+pub fn is_silent(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("[SILENT]") || t.ends_with("[SILENT]")
+}
+
 /// Agent 主入口：持有配置、工具、记忆。
 pub struct Agent {
     pub(crate) cfg: LlmConfig,

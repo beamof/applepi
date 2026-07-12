@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::{is_silent, Agent, AgentEvent};
 use crate::config::Config;
 use crate::tools::Tool;
 
@@ -670,13 +670,6 @@ async fn report_error(
             .send()
             .await;
     }
-}
-
-/// 判断一条回复是否标记为静默（不发送给用户）。
-/// agent 在回复开头或结尾加 `[SILENT]` 即触发。
-fn is_silent(s: &str) -> bool {
-    let t = s.trim();
-    t.starts_with("[SILENT]") || t.ends_with("[SILENT]")
 }
 
 /// 删除指定消息（用于静默输出时清掉占位消息）。失败静默忽略。

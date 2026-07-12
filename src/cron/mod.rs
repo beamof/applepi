@@ -19,7 +19,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::{is_silent, Agent, AgentEvent};
 use crate::config::Config;
 use crate::memory::long_term::LongTermMemory;
 use crate::tools::{Tool, ToolMap};
@@ -238,6 +238,11 @@ async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
         }
     }
     let reply = reply.trim();
+    // 静默输出：agent 用 [SILENT] 标记（开头或结尾）表示这条回复不发往用户。
+    if is_silent(reply) {
+        tracing::info!("[cron:{}] 回复标记为 [SILENT]，跳过推送", job.name);
+        return Ok(());
+    }
     let text = if reply.is_empty() {
         if exhausted {
             "（已达最大轮次上限，定时任务无人值守，自动停止）".to_string()

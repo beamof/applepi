@@ -789,7 +789,13 @@ async fn render_events(
                 edit_text(http, base, chat_id, msg_id, &display).await;
             }
             AgentEvent::Final(t) => {
-                buf = t;
+                // 模型多步任务末尾可能返回空 Final（视为已完成），这里给个
+                // 兜底文案，避免把消息编辑成空白、看起来像"执行到一半没后续"。
+                buf = if t.trim().is_empty() {
+                    "（已完成，无更多输出）".to_string()
+                } else {
+                    t
+                };
                 tool_log.clear();
             }
             AgentEvent::ContinuePrompt(note) => {

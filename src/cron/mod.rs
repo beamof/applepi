@@ -237,15 +237,21 @@ async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
             _ => {}
         }
     }
-    if reply.is_empty() {
-        reply = if exhausted {
-            "（已达最大轮次上限，定时任务无人值守，自动停止）".into()
+    let reply = reply.trim();
+    let text = if reply.is_empty() {
+        if exhausted {
+            "（已达最大轮次上限，定时任务无人值守，自动停止）".to_string()
         } else {
-            "（无输出）".into()
-        };
-    }
+            // 模型本轮无文本产出（常见于只调用工具未做总结），
+            // 静默跳过推送，避免用「（无输出）」打扰用户
+            tracing::warn!("[cron:{}] 触发完成但无文本输出，跳过推送", job.name);
+            return Ok(());
+        }
+    } else {
+        reply.to_string()
+    };
     // Telegram 文本上限 4096，截断保护
-    let safe: String = reply.chars().take(4000).collect();
+    let safe: String = text.chars().take(4000).collect();
     let resp = ctx
         .http
         .post(format!("{}/sendMessage", ctx.base))

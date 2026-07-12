@@ -179,10 +179,17 @@ impl Agent {
                 continue;
             }
 
-            // 纯文本答复结束
+            // 纯文本答复结束。
+            // 注意：模型有时在多步任务末尾返回空 content（既不调工具也不输出
+            // 文字，视为已完成），这里照常产出 Final("")，由调用方各自决定
+            // 如何呈现（bot 显示兜底文案；cron 静默跳过）。
             self.history.add(Message {
                 role: "assistant".into(),
-                content: Some(text_buf.clone()),
+                content: if text_buf.is_empty() {
+                    None
+                } else {
+                    Some(text_buf.clone())
+                },
                 ..Default::default()
             });
             events.push(AgentEvent::Final(text_buf));

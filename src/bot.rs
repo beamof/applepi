@@ -78,6 +78,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     api_key.clone(),
                     http.clone(),
                     base.clone(),
+                    reload_tx.clone(),
                     reload_rx,
                 ));
                 Some(store)

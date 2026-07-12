@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::memory::long_term::LongTermMemory;
-use crate::tools::ToolMap;
+use crate::tools::{Tool, ToolMap};
 
 /// 北京时间（UTC+8）。
 fn beijing_tz() -> FixedOffset {
@@ -31,6 +31,7 @@ fn beijing_tz() -> FixedOffset {
 
 /// 启动 scheduler。
 ///
+/// - `reload_tx`：agent 通过 cron 工具改动 DB 后发信号触发重载（与 bot 侧共享同一通道）。
 /// - `reload_rx`：收到信号就重载 DB（增删改 job 后 bot 侧会发信号）。
 ///
 /// 该函数会一直运行（直到进程退出），应在 `tokio::spawn` 中调用。
@@ -39,6 +40,7 @@ pub async fn run(
     api_key: String,
     http: Client,
     base: String,
+    reload_tx: watch::Sender<()>,
     mut reload_rx: watch::Receiver<()>,
 ) -> Result<()> {
     if !cfg.cron.enabled {
@@ -54,8 +56,15 @@ pub async fn run(
     let llm_cfg = cfg.llm_config(api_key.clone());
     let embed_cfg = cfg.embeddings_config(api_key.clone());
     let persona = crate::config::load_persona("AGENTS.md")?;
+    // 工具集与 bot.rs 对齐：default + MCP + Cron 管理 + Shell（按开关）
     let mut tools = crate::tools::default_tools();
     tools.extend(crate::mcp::load_mcp_tools(&cfg.mcp_servers).await?);
+    let t = Arc::new(crate::tools::cron::CronTool::new(store.clone(), reload_tx.clone()));
+    tools.insert(t.name().to_string(), t);
+    if cfg.shell.enabled {
+        let t = Arc::new(crate::tools::shell::ShellTool::new(&cfg.shell));
+        tools.insert(t.name().to_string(), t);
+    }
     let tools = Arc::new(tools);
     let top_k = cfg.memory.top_k_or(3);
     let db_path = cfg.memory.db_path.clone();

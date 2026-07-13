@@ -74,6 +74,9 @@ pub async fn chat(
 pub struct LlmResponse {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// finish_reason：stop（正常结束）/ length（达 max_tokens 被截断）/ tool_calls 等。
+    /// 调用方据此区分"模型说完了"和"被截断了"。
+    pub finish_reason: Option<String>,
 }
 
 impl LlmResponse {
@@ -97,6 +100,8 @@ pub enum Delta {
     ToolCalls(Vec<ToolCall>),
     /// 本轮已给出最终文本答复（content 字段结束）
     Final,
+    /// 本轮因 max_tokens 被截断（finish_reason=length），调用方应继续下一轮接续
+    Truncated,
 }
 
 /// 流式 chat。tool_calls 走非流式（在内部完成）；纯文本走 SSE 增量推送。
@@ -119,6 +124,19 @@ pub fn chat_stream(
         };
         if let Some(calls) = probe.tool_calls {
             let _ = tx.send(Ok(Delta::ToolCalls(calls))).await;
+            let _ = tx.send(Ok(Delta::Final)).await;
+            return;
+        }
+        // 无 tool_calls 但被 max_tokens 截断：发 Truncated，让 agent 续轮接续，
+        // 而不是把半截文字当成最终答复。
+        if probe.finish_reason.as_deref() == Some("length") {
+            let _ = tx.send(Ok(Delta::Truncated)).await;
+            // 把已有的半截文本也透传给 agent，由 agent 入历史后继续
+            if let Some(t) = probe.content {
+                if !t.is_empty() {
+                    let _ = tx.send(Ok(Delta::Text(t))).await;
+                }
+            }
             let _ = tx.send(Ok(Delta::Final)).await;
             return;
         }
@@ -258,6 +276,13 @@ fn parse_choice(json: Value) -> Result<LlmResponse> {
     let tool_calls = msg
         .get("tool_calls")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+    // finish_reason 在 choices[0] 上，而非 message 上
+    let finish_reason = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
-    Ok(LlmResponse { content, tool_calls })
+    Ok(LlmResponse { content, tool_calls, finish_reason })
 }

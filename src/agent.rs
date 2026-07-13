@@ -137,6 +137,7 @@ impl Agent {
 
             let mut text_buf = String::new();
             let mut tool_calls: Option<Vec<ToolCall>> = None;
+            let mut truncated = false;
 
             while let Some(item) = rx.recv().await {
                 match item? {
@@ -148,6 +149,9 @@ impl Agent {
                         tool_calls = Some(calls);
                     }
                     Delta::Final => {}
+                    Delta::Truncated => {
+                        truncated = true;
+                    }
                 }
             }
 
@@ -183,6 +187,22 @@ impl Agent {
                     ));
                 }
                 // 继续下一轮
+                continue;
+            }
+
+            // 被 max_tokens 截断：把已有的半截文本入历史，让模型在下一轮接续写完，
+            // 而不是把半句话当成最终答复推送出去（典型表现如"输出被截断了，让我
+            // 提取完整的 message ID 列表进行对比"被原样发出去）。
+            if truncated {
+                self.history.add(Message {
+                    role: "assistant".into(),
+                    content: if text_buf.is_empty() {
+                        None
+                    } else {
+                        Some(text_buf.clone())
+                    },
+                    ..Default::default()
+                });
                 continue;
             }
 

@@ -58,38 +58,6 @@ pub struct LlmConfig {
     pub model: String,
 }
 
-/// 一次非流式调用，用于在流式循环里完成 tool_calls（流式拼接 arguments 复杂，
-/// 多轮工具调用走非流式更稳）。
-pub async fn chat(
-    cfg: &LlmConfig,
-    messages: &[Message],
-    tools: &ToolMap,
-    client: &Client,
-) -> Result<LlmResponse> {
-    let body = build_body(cfg, messages, tools, false);
-    let resp = send(cfg, body, client).await?;
-    parse_choice(resp)
-}
-
-pub struct LlmResponse {
-    pub content: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
-    /// finish_reason：stop（正常结束）/ length（达 max_tokens 被截断）/ tool_calls 等。
-    /// 调用方据此区分"模型说完了"和"被截断了"。
-    pub finish_reason: Option<String>,
-}
-
-impl LlmResponse {
-    pub fn into_message(self) -> Message {
-        Message {
-            role: "assistant".into(),
-            content: self.content,
-            tool_calls: self.tool_calls,
-            ..Default::default()
-        }
-    }
-}
-
 // ---------- 流式 ----------
 
 #[derive(Debug, Clone)]
@@ -104,8 +72,13 @@ pub enum Delta {
     Truncated,
 }
 
-/// 流式 chat。tool_calls 走非流式（在内部完成）；纯文本走 SSE 增量推送。
-/// 通过 `Delta` 统一对外，调用方无需关心差异。
+/// 流式 chat，单次请求完成。SSE 流内同时处理三种增量：
+/// - 文本（delta.content）→ `Delta::Text` 增量透传
+/// - 工具调用（delta.tool_calls）→ 按 index 聚合（首片带 id/type/name，
+///   arguments 跨多片拼接）
+/// - finish_reason → 区分 stop（正常）/ tool_calls / length（截断）
+///
+/// 收尾时按结果发 `ToolCalls` / `Truncated` / 都不发，最后发 `Final`。
 pub fn chat_stream(
     cfg: LlmConfig,
     messages: Vec<Message>,
@@ -114,34 +87,6 @@ pub fn chat_stream(
 ) -> mpsc::Receiver<Result<Delta>> {
     let (tx, rx) = mpsc::channel::<Result<Delta>>(32);
     tokio::spawn(async move {
-        // 先发非流式请求探测：是否要调工具
-        let probe = match chat(&cfg, &messages, &tools, &client).await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        };
-        if let Some(calls) = probe.tool_calls {
-            let _ = tx.send(Ok(Delta::ToolCalls(calls))).await;
-            let _ = tx.send(Ok(Delta::Final)).await;
-            return;
-        }
-        // 无 tool_calls 但被 max_tokens 截断：发 Truncated，让 agent 续轮接续，
-        // 而不是把半截文字当成最终答复。
-        if probe.finish_reason.as_deref() == Some("length") {
-            let _ = tx.send(Ok(Delta::Truncated)).await;
-            // 把已有的半截文本也透传给 agent，由 agent 入历史后继续
-            if let Some(t) = probe.content {
-                if !t.is_empty() {
-                    let _ = tx.send(Ok(Delta::Text(t))).await;
-                }
-            }
-            let _ = tx.send(Ok(Delta::Final)).await;
-            return;
-        }
-
-        // 纯文本路径：SSE 流
         let body = build_body(&cfg, &messages, &tools, true);
         let resp = match client
             .post(format!("{}/chat/completions", cfg.api_base))
@@ -163,16 +108,21 @@ pub fn chat_stream(
             return;
         }
 
+        // SSE 内 tool_calls 按 index 分片到达，需跨片聚合。
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+
         let mut byte_stream = resp.bytes_stream();
         let mut buf = String::new();
-        let mut finished = false;
-        while let Some(chunk) = byte_stream.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
+        let mut done = false;
+        while !done {
+            let chunk = match byte_stream.next().await {
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
                     let _ = tx.send(Err(anyhow!("stream error: {e}"))).await;
                     return;
                 }
+                None => break,
             };
             buf.push_str(std::str::from_utf8(&chunk).unwrap_or(""));
             while let Some(idx) = buf.find('\n') {
@@ -185,34 +135,85 @@ pub fn chat_stream(
                     continue;
                 };
                 if data == "[DONE]" {
-                    finished = true;
+                    done = true;
                     break;
                 }
                 let v: Value = match serde_json::from_str(data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let delta = v
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
+                let choice = match v.get("choices").and_then(|c| c.get(0)) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let delta = choice.get("delta");
+                // 增量文本
+                if let Some(text) = delta
                     .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str());
-                if let Some(text) = delta {
-                    if !text.is_empty() {
-                        if tx.send(Ok(Delta::Text(text.to_string()))).await.is_err() {
-                            return; // 接收端提前结束
-                        }
+                    .and_then(|c| c.as_str())
+                {
+                    if !text.is_empty()
+                        && tx.send(Ok(Delta::Text(text.to_string()))).await.is_err()
+                    {
+                        return; // 接收端提前结束
                     }
                 }
+                // 工具调用分片聚合
+                if let Some(tc_arr) = delta.and_then(|d| d.get("tool_calls")) {
+                    merge_tool_call_deltas(&mut tool_calls, tc_arr);
+                }
+                // finish_reason（通常在最后一片给出）
+                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                    finish_reason = Some(fr.to_string());
+                }
             }
-            if finished {
-                break;
-            }
+        }
+
+        // 收尾：按 finish_reason 和聚合结果决定语义
+        if !tool_calls.is_empty() {
+            let _ = tx.send(Ok(Delta::ToolCalls(tool_calls))).await;
+        } else if finish_reason.as_deref() == Some("length") {
+            // 被 max_tokens 截断：文本已增量透传，只发标志让 agent 续轮
+            let _ = tx.send(Ok(Delta::Truncated)).await;
         }
         let _ = tx.send(Ok(Delta::Final)).await;
     });
     rx
+}
+
+/// 聚合 SSE 流里分片到达的 tool_calls。
+/// 每片形如 `{"index":N,"id":..,"type":..,"function":{"name":..,"arguments":..}}`：
+/// 首片带 id/type/function.name，后续片只增量追加 function.arguments。
+fn merge_tool_call_deltas(out: &mut Vec<ToolCall>, arr: &Value) {
+    let Some(arr) = arr.as_array() else { return };
+    for d in arr {
+        let idx = d.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+        while out.len() <= idx {
+            out.push(ToolCall {
+                id: String::new(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: String::new(),
+                    arguments: String::new(),
+                },
+            });
+        }
+        let tc = &mut out[idx];
+        if let Some(id) = d.get("id").and_then(|v| v.as_str()) {
+            tc.id = id.to_string();
+        }
+        if let Some(ty) = d.get("type").and_then(|v| v.as_str()) {
+            tc.r#type = ty.to_string();
+        }
+        if let Some(func) = d.get("function") {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                tc.function.name = name.to_string();
+            }
+            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                tc.function.arguments.push_str(args);
+            }
+        }
+    }
 }
 
 // ---------- 内部 ----------
@@ -247,42 +248,4 @@ fn build_body(
         body["stream_options"] = json!({ "include_usage": false });
     }
     body
-}
-
-async fn send(cfg: &LlmConfig, body: Value, client: &Client) -> Result<Value> {
-    let resp = client
-        .post(format!("{}/chat/completions", cfg.api_base))
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("LLM 请求失败 [{status}]: {text}"));
-    }
-    Ok(resp.json().await?)
-}
-
-fn parse_choice(json: Value) -> Result<LlmResponse> {
-    let msg = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .ok_or_else(|| anyhow!("响应缺少 choices[0].message"))?;
-
-    let content = msg.get("content").and_then(|v| v.as_str()).map(String::from);
-    let tool_calls = msg
-        .get("tool_calls")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-    // finish_reason 在 choices[0] 上，而非 message 上
-    let finish_reason = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    Ok(LlmResponse { content, tool_calls, finish_reason })
 }

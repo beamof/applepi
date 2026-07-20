@@ -7,8 +7,6 @@ use std::collections::HashMap;
 pub struct Config {
     pub llm: LlmSection,
     #[serde(default)]
-    pub embeddings: EmbeddingsSection,
-    #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
     pub telegram: TelegramSection,
@@ -34,18 +32,6 @@ pub struct LlmSection {
     /// Anthropic / 部分 OpenAI 兼容端点支持；DeepSeek / GLM 等自动缓存端点保持 false。默认 false。
     #[serde(default)]
     pub prompt_cache_control: bool,
-}
-
-#[derive(Deserialize, Clone, Default)]
-pub struct EmbeddingsSection {
-    /// 本地 embedding 模型名（默认 bge-small-zh-v1.5）。可选：
-    /// bge-small-zh-v1.5 | bge-large-zh-v1.5 | bge-small-en-v1.5 | bge-base-en-v1.5
-    /// | multilingual-e5-small | multilingual-e5-base | multilingual-e5-large | bge-m3
-    #[serde(default)]
-    pub model: String,
-    /// 模型缓存目录。留空 = HF 默认（~/.cache/huggingface 或 HF_HOME）。
-    #[serde(default)]
-    pub cache_dir: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Default)]

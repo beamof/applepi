@@ -10,20 +10,10 @@ llm:
   # API Key：留空则回退到环境变量 OPENAI_API_KEY（或 API_KEY）
   api_key: ""
 
-embeddings:
-  # 本地 embedding 模型（基于 candle 纯 Rust 推理，离线、无需 API key）。
-  # 可选：bge-small-zh-v1.5（默认，512 维，~100MB，中文优化）
-  #       bge-large-zh-v1.5（1024 维，~1.2GB，质量更好）
-  #       multilingual-e5-small / base / large（多语言均衡）
-  #       bge-small-en-v1.5 / bge-base-en-v1.5（纯英文）
-  # 首次启动会自动从 HuggingFace 下载权重（默认 ~/.cache/huggingface）。
-  model: bge-small-zh-v1.5
-  # cache_dir: ./model_cache  # 自定义模型缓存目录；留空用 HF_HOME 默认
-
 memory:
   enabled: true
   db_path: data/applepi.db
-  top_k: 3 # 每次对话注入的最多相关记忆数
+  top_k: 3 # 每次对话注入的最多相关记忆数（FTS5 BM25 排序）
 
 telegram:
   # bot_token 留空则从环境变量 TELEGRAM_BOT_TOKEN 读取

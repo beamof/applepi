@@ -21,11 +21,6 @@ async fn main() -> anyhow::Result<()> {
     persona.push_str(&config::load_skills_summary("skills"));
 
     let long_term = if cfg.memory.enabled {
-        // 预热本地 embedding 模型（同步加载，CLI 启动一次即可）
-        let _ = applepi::memory::embed::LocalEmbedder::global(
-            &cfg.embeddings.model,
-            cfg.embeddings.cache_dir.as_deref(),
-        );
         Some(LongTermMemory::open(&cfg.memory.db_path)?)
     } else {
         None

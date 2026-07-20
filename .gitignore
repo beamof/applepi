@@ -9,10 +9,8 @@ debug/
 # 运行时数据（用户记忆库）
 /data
 
-# 本地 embedding 模型缓存（candle 下载的 safetensors 权重，体积大，不入库）。
-# 默认位置由 hf-hub 决定：~/.cache/huggingface/hub；可在 config.yaml 设 embeddings.cache_dir。
+# 废弃的 fastembed 模型缓存（已切换到 FTS5，不再使用，保留以免误删用户文件）
 /.fastembed_cache
-/model_cache
 
 # 工具临时目录
 /.zcode

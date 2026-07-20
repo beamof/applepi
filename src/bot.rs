@@ -50,27 +50,8 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     let mut persona = crate::config::load_persona("AGENTS.md")?;
     persona.push_str(&crate::config::load_skills_summary("skills"));
 
-    // 启动期并行预热两件慢事（都在后台，不阻塞主循环进入）：
-    // 1. 本地 embedding 模型加载（首次约 200ms~1s，可能下载 ~100MB 模型）
-    // 2. LLM endpoint 的 TLS/HTTP2 连接建立
-    if cfg.memory.enabled {
-        let model = cfg.embeddings.model.clone();
-        let cache_dir = cfg.embeddings.cache_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let started = std::time::Instant::now();
-            match crate::memory::embed::LocalEmbedder::global(&model, cache_dir.as_deref()) {
-                Ok(e) => tracing::info!(
-                    "LocalEmbedder 预热完成，dim={}，耗时 {:?}",
-                    e.dim,
-                    started.elapsed()
-                ),
-                Err(e) => tracing::error!("LocalEmbedder 预热失败（记忆功能将不可用）: {e}"),
-            }
-        });
-    }
-
-    // 后台预热：发一个最小请求到 LLM endpoint，触发 TLS 握手 + HTTP/2 连接建立，
-    // 把首次真实对话的握手成本前移到启动期。失败静默，不影响启动。
+    // 启动期后台预热：发一个最小请求到 LLM endpoint，触发 TLS 握手 + HTTP/2
+    // 连接建立，把首次真实对话的握手成本前移到启动期。失败静默，不影响启动。
     {
         let warmup_http = http.clone();
         let warmup_cfg = llm_cfg.clone();

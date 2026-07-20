@@ -15,7 +15,7 @@ const SCHEMA_VERSION: u32 = 2;
 /// 长期记忆：用 SQLite 存文本+向量，cosine 相似度检索。
 /// 设计权衡：避免引入额外向量库依赖，记忆条数在几千以内足够用。
 ///
-/// 向量由本地 `LocalEmbedder` 生成（fastembed/ONNX），无网络往返。
+/// 向量由本地 `LocalEmbedder` 生成（candle 纯 Rust 推理），无网络往返。
 pub struct LongTermMemory {
     conn: Mutex<Connection>,
 }

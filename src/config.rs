@@ -43,7 +43,7 @@ pub struct EmbeddingsSection {
     /// | multilingual-e5-small | multilingual-e5-base | multilingual-e5-large | bge-m3
     #[serde(default)]
     pub model: String,
-    /// 模型缓存目录。留空 = fastembed 默认（./.fastembed_cache 或 FASTEMBED_CACHE_DIR）。
+    /// 模型缓存目录。留空 = HF 默认（~/.cache/huggingface 或 HF_HOME）。
     #[serde(default)]
     pub cache_dir: Option<String>,
 }

@@ -11,15 +11,14 @@ llm:
   api_key: ""
 
 embeddings:
-  # 本地 embedding 模型（基于 fastembed/ONNX，离线推理，无需 API key）。
+  # 本地 embedding 模型（基于 candle 纯 Rust 推理，离线、无需 API key）。
   # 可选：bge-small-zh-v1.5（默认，512 维，~100MB，中文优化）
   #       bge-large-zh-v1.5（1024 维，~1.2GB，质量更好）
   #       multilingual-e5-small / base / large（多语言均衡）
-  #       bge-m3（1024 维，~2GB，最强但加载最慢）
   #       bge-small-en-v1.5 / bge-base-en-v1.5（纯英文）
-  # 首次启动会自动下载模型到 cache_dir（默认 ./.fastembed_cache）。
+  # 首次启动会自动从 HuggingFace 下载权重（默认 ~/.cache/huggingface）。
   model: bge-small-zh-v1.5
-  # cache_dir: ./model_cache  # 自定义模型缓存目录；留空用 fastembed 默认
+  # cache_dir: ./model_cache  # 自定义模型缓存目录；留空用 HF_HOME 默认
 
 memory:
   enabled: true

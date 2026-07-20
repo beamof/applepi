@@ -1,37 +1,27 @@
-use anyhow::{anyhow, Result};
-use reqwest::Client;
+use anyhow::Result;
 use rusqlite::{params, Connection};
-use serde::Deserialize;
-use serde_json::json;
+use serde_json;
 use std::sync::Mutex;
+
+use super::embed::LocalEmbedder;
+
+/// Schema 版本号：写在 SQLite 的 `PRAGMA user_version`。
+/// - 0: 旧版（远程云端 embedding，1536 维）
+/// - 2: 本地 embedding（bge-small-zh 等，维度由模型决定）
+///
+/// 升级到 2 时会清空 memories 表（远程向量维度与本地不兼容）。
+const SCHEMA_VERSION: u32 = 2;
 
 /// 长期记忆：用 SQLite 存文本+向量，cosine 相似度检索。
 /// 设计权衡：避免引入额外向量库依赖，记忆条数在几千以内足够用。
+///
+/// 向量由本地 `LocalEmbedder` 生成（fastembed/ONNX），无网络往返。
 pub struct LongTermMemory {
     conn: Mutex<Connection>,
-    embed: EmbedConfig,
-    http: Client,
-}
-
-#[derive(Clone)]
-pub struct EmbedConfig {
-    pub api_base: String,
-    pub api_key: String,
-    pub model: String,
-}
-
-#[derive(Deserialize)]
-struct EmbedResp {
-    data: Vec<EmbedItem>,
-}
-
-#[derive(Deserialize)]
-struct EmbedItem {
-    embedding: Vec<f32>,
 }
 
 impl LongTermMemory {
-    pub fn open(db_path: &str, embed: EmbedConfig) -> Result<Self> {
+    pub fn open(db_path: &str) -> Result<Self> {
         if let Some(parent) = std::path::Path::new(db_path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).ok();
@@ -46,38 +36,15 @@ impl LongTermMemory {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
         )?;
-        Ok(Self { conn: Mutex::new(conn), embed, http: Client::new() })
+        migrate(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let body = json!({
-            "model": self.embed.model,
-            "input": text,
-        });
-        let resp = self
-            .http
-            .post(format!("{}/embeddings", self.embed.api_base))
-            .bearer_auth(&self.embed.api_key)
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let t = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("embedding 请求失败 [{status}]: {t}"));
-        }
-        let parsed: EmbedResp = resp.json().await?;
-        parsed
-            .data
-            .into_iter()
-            .next()
-            .map(|i| i.embedding)
-            .ok_or_else(|| anyhow!("embedding 响应为空"))
-    }
-
-    /// 存一条记忆
+    /// 存一条记忆。embedding 来自进程级单例 `LocalEmbedder`。
     pub async fn remember(&self, text: &str) -> Result<()> {
-        let emb = self.embed(text).await?;
+        let emb = LocalEmbedder::global("", None)?.embed(text.to_string()).await?;
         let emb_json = serde_json::to_string(&emb)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -87,9 +54,9 @@ impl LongTermMemory {
         Ok(())
     }
 
-    /// 检索 Top-K 相关记忆
+    /// 检索 Top-K 相关记忆。query embedding 来自本地推理，无网络往返。
     pub async fn recall(&self, query: &str, top_k: usize) -> Result<Vec<String>> {
-        let q_emb = self.embed(query).await?;
+        let q_emb = LocalEmbedder::global("", None)?.embed(query.to_string()).await?;
         let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT text, embedding FROM memories ORDER BY id DESC LIMIT 2000")?;
@@ -122,4 +89,26 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (na * nb)
     }
+}
+
+/// Schema 迁移：根据 `PRAGMA user_version` 决定动作。
+///
+/// v0 → v2：检测旧版云端 embedding（1536 维，与新本地模型维度不兼容），
+/// 清空 memories 表后写入新版本号。
+fn migrate(conn: &Connection) -> Result<()> {
+    let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    // 仅在当前为 v0 且表里有数据时清空。
+    let count: u64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+    if count > 0 {
+        tracing::warn!(
+            "检测到旧版远程 embedding（{} 条），与新本地模型维度不兼容；清空 memories 表重建。",
+            count
+        );
+        conn.execute("DELETE FROM memories", [])?;
+    }
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    Ok(())
 }

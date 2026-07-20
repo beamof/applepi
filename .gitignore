@@ -8,3 +8,9 @@ debug/
 
 # 运行时数据（用户记忆库）
 /data
+
+# 本地 embedding 模型缓存（fastembed 下载的 ONNX 模型，体积大，不入库）
+/.fastembed_cache
+
+# 工具临时目录
+/.zcode

@@ -54,7 +54,6 @@ pub async fn run(
 
     // 预构造 agent 所需的共享件
     let llm_cfg = cfg.llm_config(api_key.clone());
-    let embed_cfg = cfg.embeddings_config(api_key.clone());
     let persona = crate::config::load_persona("AGENTS.md")?;
     // 工具集与 bot.rs 对齐：default + MCP + Cron 管理 + Shell（按开关）
     let mut tools = crate::tools::default_tools();
@@ -95,7 +94,6 @@ pub async fn run(
         for job in jobs {
             let ctx = Arc::new(JobCtx {
                 llm_cfg: llm_cfg.clone(),
-                embed_cfg: embed_cfg.clone(),
                 persona: persona.clone(),
                 tools: tools.clone(),
                 top_k,
@@ -128,7 +126,6 @@ pub async fn run(
 /// 单个 job 的运行上下文（共享、只读）。
 struct JobCtx {
     llm_cfg: crate::llm::LlmConfig,
-    embed_cfg: crate::memory::long_term::EmbedConfig,
     persona: String,
     tools: Arc<ToolMap>,
     top_k: usize,
@@ -209,7 +206,7 @@ async fn run_job(job: store::JobRecord, ctx: Arc<JobCtx>, reload_rx: &mut watch:
 /// 触发一次 job：构造 Agent → chat_stream → 拼接最终文本 → 推送到 Telegram。
 async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
     let long_term = if ctx.memory_enabled {
-        Some(LongTermMemory::open(&ctx.db_path, ctx.embed_cfg.clone())?)
+        Some(LongTermMemory::open(&ctx.db_path)?)
     } else {
         None
     };
@@ -219,6 +216,7 @@ async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
         ctx.tools.as_ref().clone(),
         long_term,
         ctx.top_k,
+        ctx.http.clone(),
     );
 
     let events = agent.chat_stream(&job.prompt).await?;

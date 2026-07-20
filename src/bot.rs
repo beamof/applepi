@@ -43,26 +43,59 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
         anyhow::bail!("未配置 TELEGRAM_BOT_TOKEN");
     }
 
-    let http = Client::new();
+    let http = crate::llm::build_http_client()?;
     let base = format!("{TG_API}/bot{token}");
 
     let llm_cfg = cfg.llm_config(api_key.clone());
-    let embed_cfg = cfg.embeddings_config(api_key.clone());
     let mut persona = crate::config::load_persona("AGENTS.md")?;
     persona.push_str(&crate::config::load_skills_summary("skills"));
 
-    // 预热 long_term（共享 embedding 客户端即可，每个 agent 各持一份简化处理）
-    let long_term = if cfg.memory.enabled {
-        Some(crate::memory::long_term::LongTermMemory::open(
-            &cfg.memory.db_path,
-            embed_cfg.clone(),
-        )?)
-    } else {
-        None
-    };
-    // 注意：long_term 内含 Mutex<Connection>，跨 agent 共享需 Arc。
-    // 这里为简化，每个 actor 重新 open 一份（SQLite 多连接没问题）。
-    drop(long_term);
+    // 启动期并行预热两件慢事（都在后台，不阻塞主循环进入）：
+    // 1. 本地 embedding 模型加载（首次约 200ms~1s，可能下载 ~100MB 模型）
+    // 2. LLM endpoint 的 TLS/HTTP2 连接建立
+    if cfg.memory.enabled {
+        let model = cfg.embeddings.model.clone();
+        let cache_dir = cfg.embeddings.cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            match crate::memory::embed::LocalEmbedder::global(&model, cache_dir.as_deref()) {
+                Ok(e) => tracing::info!(
+                    "LocalEmbedder 预热完成，dim={}，耗时 {:?}",
+                    e.dim,
+                    started.elapsed()
+                ),
+                Err(e) => tracing::error!("LocalEmbedder 预热失败（记忆功能将不可用）: {e}"),
+            }
+        });
+    }
+
+    // 后台预热：发一个最小请求到 LLM endpoint，触发 TLS 握手 + HTTP/2 连接建立，
+    // 把首次真实对话的握手成本前移到启动期。失败静默，不影响启动。
+    {
+        let warmup_http = http.clone();
+        let warmup_cfg = llm_cfg.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let res = warmup_http
+                .post(format!("{}/chat/completions", warmup_cfg.api_base))
+                .bearer_auth(&warmup_cfg.api_key)
+                .json(&json!({
+                    "model": warmup_cfg.model,
+                    "messages": [{"role":"user","content":"hi"}],
+                    "max_tokens": 1,
+                    "stream": false,
+                }))
+                .send()
+                .await;
+            match res {
+                Ok(_) => tracing::info!(
+                    "LLM 连接池预热完成，耗时 {:?}",
+                    started.elapsed()
+                ),
+                Err(e) => tracing::warn!("LLM 连接池预热失败（不影响启动）: {e}"),
+            }
+        });
+    }
 
     // Cron scheduler：仅当启用时启动。watch 通道用于 agent 通过 cron 工具改动后通知重载。
     // 必须在 tools 构建前完成，以便把 store 注入 CronTool。
@@ -109,7 +142,6 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     // 构建新 actor 所需的共享上下文（Clone 便宜：全是 Arc）
     let ctx = Arc::new(ChatCtx {
         llm_cfg,
-        embed_cfg,
         persona,
         tools,
         cfg: cfg.clone(),
@@ -220,7 +252,6 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
 /// 构建新 actor 所需的共享上下文。所有字段 Clone 便宜（Arc 或已 Clone 的配置）。
 struct ChatCtx {
     llm_cfg: crate::llm::LlmConfig,
-    embed_cfg: crate::memory::long_term::EmbedConfig,
     persona: String,
     tools: crate::tools::ToolMap,
     cfg: Config,
@@ -252,11 +283,7 @@ impl ChatActor {
     fn spawn(chat_id: i64, ctx: Arc<ChatCtx>) -> ChatHandle {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
         let lt = if ctx.cfg.memory.enabled {
-            crate::memory::long_term::LongTermMemory::open(
-                &ctx.cfg.memory.db_path,
-                ctx.embed_cfg.clone(),
-            )
-            .ok()
+            crate::memory::long_term::LongTermMemory::open(&ctx.cfg.memory.db_path).ok()
         } else {
             None
         };
@@ -266,6 +293,7 @@ impl ChatActor {
             ctx.tools.clone(),
             lt,
             ctx.top_k,
+            ctx.http.clone(),
         );
         let mut actor = ChatActor {
             chat_id,

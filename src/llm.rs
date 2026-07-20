@@ -3,9 +3,23 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::tools::ToolMap;
+
+/// 统一构建共享 HTTP 客户端：池化连接、TCP keepalive、合理超时。
+/// 整个进程复用同一个 Client（clone 便宜，连接池共享），避免每个 Agent / 每次触发
+/// 都新建 Client 导致首次 TLS 握手成本落到首条用户消息上。
+pub fn build_http_client() -> Result<Client> {
+    Ok(Client::builder()
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()?)
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Message {
@@ -56,6 +70,10 @@ pub struct LlmConfig {
     pub api_base: String,
     pub api_key: String,
     pub model: String,
+    /// 是否给 system 消息追加 `cache_control: {type: "ephemeral"}`，
+    /// 显式声明 prompt 前缀缓存（Anthropic / 部分 OpenAI 兼容端点支持）。
+    /// DeepSeek / GLM 等自动缓存的端点保持 false 即可，避免无效字段干扰。
+    pub prompt_cache_control: bool,
 }
 
 // ---------- 流式 ----------
@@ -82,12 +100,12 @@ pub enum Delta {
 pub fn chat_stream(
     cfg: LlmConfig,
     messages: Vec<Message>,
-    tools: ToolMap,
+    tools_schema: Vec<Value>,
     client: Client,
 ) -> mpsc::Receiver<Result<Delta>> {
     let (tx, rx) = mpsc::channel::<Result<Delta>>(32);
     tokio::spawn(async move {
-        let body = build_body(&cfg, &messages, &tools, true);
+        let body = build_body(&cfg, &messages, &tools_schema, true);
         let resp = match client
             .post(format!("{}/chat/completions", cfg.api_base))
             .bearer_auth(&cfg.api_key)
@@ -218,13 +236,10 @@ fn merge_tool_call_deltas(out: &mut Vec<ToolCall>, arr: &Value) {
 
 // ---------- 内部 ----------
 
-fn build_body(
-    cfg: &LlmConfig,
-    messages: &[Message],
-    tools: &ToolMap,
-    stream: bool,
-) -> Value {
-    let tools_schema: Vec<Value> = tools
+/// 一次性把 ToolMap 序列化成 OpenAI tools schema 数组。
+/// 调用方缓存结果（如 Agent::tools_schema_cache），避免每轮 LLM 请求重复构建。
+pub fn build_tools_schema(tools: &ToolMap) -> Vec<Value> {
+    tools
         .values()
         .map(|t| {
             json!({
@@ -236,11 +251,26 @@ fn build_body(
                 }
             })
         })
-        .collect();
+        .collect()
+}
+
+fn build_body(
+    cfg: &LlmConfig,
+    messages: &[Message],
+    tools_schema: &[Value],
+    stream: bool,
+) -> Value {
+    // 可选：给首条 system 消息追加 cache_control，显式声明 prompt 前缀缓存。
+    // 仅当配置打开且首条是 system 时生效；其余情况直接序列化 messages。
+    let messages_value: Value = if cfg.prompt_cache_control {
+        annotate_system_cache_control(messages)
+    } else {
+        serde_json::to_value(messages).unwrap_or(Value::Array(vec![]))
+    };
 
     let mut body = json!({
         "model": cfg.model,
-        "messages": messages,
+        "messages": messages_value,
         "tools": tools_schema,
         "stream": stream,
     });
@@ -248,4 +278,29 @@ fn build_body(
         body["stream_options"] = json!({ "include_usage": false });
     }
     body
+}
+
+/// 把 messages 序列化为 JSON 数组，并为首条 system 消息追加 `cache_control`。
+/// 失败则回退为不带 annotation 的纯序列化（保证请求至少能发出）。
+fn annotate_system_cache_control(messages: &[Message]) -> Value {
+    let mut arr: Vec<Value> = match serde_json::to_value(messages) {
+        Ok(Value::Array(a)) => a,
+        other => return other.unwrap_or(Value::Array(vec![])),
+    };
+    if let Some(first) = arr.first_mut() {
+        let is_system = first
+            .get("role")
+            .and_then(|r| r.as_str())
+            .map(|s| s == "system")
+            .unwrap_or(false);
+        if is_system {
+            if let Some(obj) = first.as_object_mut() {
+                obj.insert(
+                    "cache_control".into(),
+                    json!({ "type": "ephemeral" }),
+                );
+            }
+        }
+    }
+    Value::Array(arr)
 }

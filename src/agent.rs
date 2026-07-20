@@ -1,7 +1,9 @@
 use anyhow::Result;
 use reqwest::Client;
+use serde_json::Value;
+use std::sync::OnceLock;
 
-use crate::llm::{chat_stream, Delta, LlmConfig, Message, ToolCall};
+use crate::llm::{build_tools_schema, chat_stream, Delta, LlmConfig, Message, ToolCall};
 use crate::memory::long_term::LongTermMemory;
 use crate::memory::short_term::History;
 use crate::tools::ToolMap;
@@ -25,6 +27,9 @@ pub struct Agent {
     pub(crate) top_k: usize,
     /// 最近一次用户输入，供续跑成功后写入长期记忆用。
     pub(crate) last_input: Option<String>,
+    /// tools schema 序列化缓存：工具集在 Agent 生命周期内不变，
+    /// 首轮构建一次后复用，避免每轮 LLM 请求都重算。
+    pub(crate) tools_schema_cache: OnceLock<Vec<Value>>,
 }
 
 /// 一次对话产出的事件流。调用方据此渲染 UI（终端逐字、Telegram 增量编辑）。
@@ -88,17 +93,19 @@ impl Agent {
         tools: ToolMap,
         long_term: Option<LongTermMemory>,
         top_k: usize,
+        http: Client,
     ) -> Self {
         let mut persona = persona;
         persona.push_str(&build_mcp_summary(&tools));
         Self {
             cfg,
             tools,
-            http: Client::new(),
+            http,
             history: History::new(persona),
             long_term,
             top_k,
             last_input: None,
+            tools_schema_cache: OnceLock::new(),
         }
     }
 
@@ -127,11 +134,22 @@ impl Agent {
     /// - 全部耗尽仍未收尾 → 发 ContinuePrompt、结束（由调用方决定是否 continue_stream 续跑）。
     async fn turn_loop(&mut self) -> Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
+        // tools schema 首轮构建一次，后续轮次复用（工具集在 Agent 生命周期内不变）。
+        if self.tools_schema_cache.get().is_none() {
+            let _ = self
+                .tools_schema_cache
+                .set(build_tools_schema(&self.tools));
+        }
+        let tools_schema = self
+            .tools_schema_cache
+            .get()
+            .expect("tools_schema_cache 已初始化")
+            .clone();
         for _ in 0..MAX_TURNS {
             let mut rx = chat_stream(
                 self.cfg.clone(),
                 self.history.all().to_vec(),
-                self.tools.clone(),
+                tools_schema.clone(),
                 self.http.clone(),
             );
 
@@ -248,7 +266,14 @@ impl Agent {
 
     /// 检索长期记忆，命中则返回格式化文本块，供调用方拼入当前 user 消息。
     /// 不再写入 system 消息，以保持 system 稳定、提高 prompt 前缀缓存命中率。
+    ///
+    /// 短输入跳过：太短（<4 字符）或纯斜杠命令（`/xxx`）的输入不检索，
+    /// 省一次本地推理且这类输入通常也不需要记忆上下文。
     async fn recall(&self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        if trimmed.len() < 4 || trimmed.starts_with('/') {
+            return None;
+        }
         let mem = self.long_term.as_ref()?;
         match mem.recall(input, self.top_k).await {
             Ok(hits) if !hits.is_empty() => {

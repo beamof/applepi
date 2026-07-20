@@ -21,7 +21,12 @@ async fn main() -> anyhow::Result<()> {
     persona.push_str(&config::load_skills_summary("skills"));
 
     let long_term = if cfg.memory.enabled {
-        Some(LongTermMemory::open(&cfg.memory.db_path, cfg.embeddings_config(api_key.clone()))?)
+        // 预热本地 embedding 模型（同步加载，CLI 启动一次即可）
+        let _ = applepi::memory::embed::LocalEmbedder::global(
+            &cfg.embeddings.model,
+            cfg.embeddings.cache_dir.as_deref(),
+        );
+        Some(LongTermMemory::open(&cfg.memory.db_path)?)
     } else {
         None
     };
@@ -41,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         tools,
         long_term,
         cfg.memory.top_k_or(3),
+        applepi::llm::build_http_client()?,
     );
 
     println!("applepi 已就绪（CLI 模式）。输入 /quit 退出。\n");

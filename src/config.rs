@@ -30,13 +30,22 @@ pub struct LlmSection {
     /// 留空则回退到环境变量 OPENAI_API_KEY（或 API_KEY）
     #[serde(default)]
     pub api_key: String,
+    /// 是否给 system 消息追加 `cache_control`（显式声明 prompt 前缀缓存）。
+    /// Anthropic / 部分 OpenAI 兼容端点支持；DeepSeek / GLM 等自动缓存端点保持 false。默认 false。
+    #[serde(default)]
+    pub prompt_cache_control: bool,
 }
 
 #[derive(Deserialize, Clone, Default)]
 pub struct EmbeddingsSection {
+    /// 本地 embedding 模型名（默认 bge-small-zh-v1.5）。可选：
+    /// bge-small-zh-v1.5 | bge-large-zh-v1.5 | bge-small-en-v1.5 | bge-base-en-v1.5
+    /// | multilingual-e5-small | multilingual-e5-base | multilingual-e5-large | bge-m3
+    #[serde(default)]
     pub model: String,
-    /// 留空则复用 llm.api_base
-    pub api_base: Option<String>,
+    /// 模型缓存目录。留空 = fastembed 默认（./.fastembed_cache 或 FASTEMBED_CACHE_DIR）。
+    #[serde(default)]
+    pub cache_dir: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -270,18 +279,7 @@ impl Config {
             api_base: self.llm.api_base.clone(),
             api_key,
             model: self.llm.model.clone(),
-        }
-    }
-
-    pub fn embeddings_config(&self, api_key: String) -> crate::memory::long_term::EmbedConfig {
-        crate::memory::long_term::EmbedConfig {
-            api_base: self
-                .embeddings
-                .api_base
-                .clone()
-                .unwrap_or_else(|| self.llm.api_base.clone()),
-            api_key,
-            model: self.embeddings.model.clone(),
+            prompt_cache_control: self.llm.prompt_cache_control,
         }
     }
 }

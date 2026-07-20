@@ -54,40 +54,6 @@ memory:
 
 **首次启动**会自动从 HuggingFace 下载模型到 `cache_dir`（默认 `./.fastembed_cache`），之后完全离线运行。
 
-#### Linux 部署：安装 ONNX Runtime 共享库
-
-项目使用 `ort/load-dynamic` 模式，运行时通过 dlopen 加载 ONNX Runtime，**Linux 部署机必须预装 `libonnxruntime.so`**（否则启动时会报 `Failed to load onnxruntime dynamic library`）。Windows / macOS 不受影响。
-
-Ubuntu / Debian：
-
-```bash
-sudo apt install libonnxruntime     # 装好后会被 ldconfig 自动注册
-ldconfig -p | grep onnxruntime      # 验证
-```
-
-如发行版没有该包，或需要特定版本（与 ort 2.0.0-rc 兼容建议 ≥ 1.20），从 [Microsoft ONNX Runtime Releases](https://github.com/microsoft/onnxruntime/releases) 下载 `onnxruntime-linux-x64-<ver>.tgz`：
-
-```bash
-# 1. 下载并解压
-tar -xzf onnxruntime-linux-x64-*.tgz
-cd onnxruntime-linux-x64-*/
-
-# 2. 把共享库放到系统目录并刷新缓存
-sudo cp lib/libonnxruntime.so* /usr/local/lib/
-sudo ldconfig
-
-# 3. 验证
-ldconfig -p | grep onnxruntime
-```
-
-装在非标准路径（不想动 `/usr/local/lib`）时，设环境变量指定：
-
-```bash
-export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
-```
-
-> `ORT_DYLIB_PATH` 是 ort `load-dynamic` 模式查找 .so 的第一优先级，优先于 `LD_LIBRARY_PATH` 和系统默认搜索路径。
-
 #### 国内网络环境（HF 被墙）
 
 如果直连 `huggingface.co` 超时，可设置 HF 镜像：

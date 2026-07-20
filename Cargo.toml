@@ -20,8 +20,11 @@ anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# ort 用 load-dynamic：运行时 dlopen libonnxruntime.so，避免静态链接 C++ 符号
+# （Linux 下 ort-sys 静态库会触发 undefined reference to `__cxa_call_terminate`）。
+# 代价：Linux 部署机需预装 onnxruntime 共享库，详见 README「Linux 部署」。
 fastembed = { version = "5.17.3", default-features = false, features = [
-    "ort-download-binaries",
+    "ort-load-dynamic",
     "hf-hub",
     "hf-hub-rustls-tls",
 ] }

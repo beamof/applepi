@@ -18,6 +18,7 @@ embeddings:
   #       bge-m3（1024 维，~2GB，最强但加载最慢）
   #       bge-small-en-v1.5 / bge-base-en-v1.5（纯英文）
   # 首次启动会自动下载模型到 cache_dir（默认 ./.fastembed_cache）。
+  # ⚠️ Linux 部署：需预装 libonnxruntime.so，否则启动报 dlopen 失败。详见 README「Linux 部署」。
   model: bge-small-zh-v1.5
   # cache_dir: ./model_cache  # 自定义模型缓存目录；留空用 fastembed 默认
 

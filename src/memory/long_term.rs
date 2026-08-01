@@ -78,6 +78,42 @@ impl LongTermMemory {
         Ok(())
     }
 
+    /// 批量存多条记忆（单事务提交）。用于记忆抽取一次性写入 N 条的场景。
+    /// 空切片直接返回 Ok。每条文本同样按字切分建索引。
+    pub async fn remember_batch(&self, texts: &[String]) -> Result<()> {
+        if texts.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        // 单事务批量提交，避免 N 次独立 INSERT 的开销。
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            for text in texts {
+                let t = text.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let indexed = char_split(t);
+                conn.execute(
+                    "INSERT INTO memories_fts (text_indexed, text_raw, created_at)
+                     VALUES (?1, ?2, datetime('now'))",
+                    params![indexed, t],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(_) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK").ok();
+                Err(e)
+            }
+        }
+    }
+
     /// 检索 Top-K 相关记忆（BM25 评分升序，分数越低越相关）。返回原始文本。
     pub async fn recall(&self, query: &str, top_k: usize) -> Result<Vec<String>> {
         let fts_query = char_split(query);

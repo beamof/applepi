@@ -9,6 +9,8 @@ llm:
   model: gemini-3-flash-agent
   # API Key：留空则回退到环境变量 OPENAI_API_KEY（或 API_KEY）
   api_key: ""
+  # 接口协议无需配置：默认先尝试 /v1/responses，端点不支持（404/400/405）时
+  # 自动回退到 /v1/chat/completions 并记住结论，后续请求不再重试 Responses。
 
 memory:
   enabled: true

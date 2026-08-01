@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use crate::agent::{is_silent, Agent, AgentEvent};
 use crate::config::Config;
 use crate::memory::long_term::LongTermMemory;
-use crate::tools::{Tool, ToolMap};
+use crate::tools::{write_memory_tool, Tool, ToolMap};
 
 /// 北京时间（UTC+8）。
 fn beijing_tz() -> FixedOffset {
@@ -64,10 +64,29 @@ pub async fn run(
         let t = Arc::new(crate::tools::shell::ShellTool::new(&cfg.shell));
         tools.insert(t.name().to_string(), t);
     }
-    let tools = Arc::new(tools);
     let top_k = cfg.memory.top_k_or(3);
     let db_path = cfg.memory.db_path.clone();
     let memory_enabled = cfg.memory.enabled;
+
+    // 长期记忆库：open 一次，Arc 共享给所有 job 的 agent 与 write_memory 工具。
+    // 记忆启用时把写记忆工具插入工具集（在 Arc 化之前完成，所有 job 共享一份）。
+    let long_term: Option<Arc<LongTermMemory>> = if memory_enabled {
+        match LongTermMemory::open(&db_path) {
+            Ok(m) => {
+                let arc = Arc::new(m);
+                let t = write_memory_tool(arc.clone());
+                tools.insert(t.name().to_string(), t);
+                Some(arc)
+            }
+            Err(e) => {
+                tracing::error!("[cron] 长期记忆库打开失败，记忆功能未启用: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tools = Arc::new(tools);
 
     tracing::info!("Cron scheduler 已启动");
 
@@ -97,8 +116,7 @@ pub async fn run(
                 persona: persona.clone(),
                 tools: tools.clone(),
                 top_k,
-                db_path: db_path.clone(),
-                memory_enabled,
+                long_term: long_term.clone(),
                 http: http.clone(),
                 base: base.clone(),
             });
@@ -129,8 +147,8 @@ struct JobCtx {
     persona: String,
     tools: Arc<ToolMap>,
     top_k: usize,
-    db_path: String,
-    memory_enabled: bool,
+    /// 共享长期记忆库（启动时 open 一次）。记忆未启用时为 None。
+    long_term: Option<Arc<LongTermMemory>>,
     http: Client,
     base: String,
 }
@@ -205,16 +223,11 @@ async fn run_job(job: store::JobRecord, ctx: Arc<JobCtx>, reload_rx: &mut watch:
 
 /// 触发一次 job：构造 Agent → chat_stream → 拼接最终文本 → 推送到 Telegram。
 async fn trigger_job(job: &store::JobRecord, ctx: &JobCtx) -> Result<()> {
-    let long_term = if ctx.memory_enabled {
-        Some(LongTermMemory::open(&ctx.db_path)?)
-    } else {
-        None
-    };
     let mut agent = Agent::new(
         ctx.llm_cfg.clone(),
         ctx.persona.clone(),
         ctx.tools.as_ref().clone(),
-        long_term,
+        ctx.long_term.clone(),
         ctx.top_k,
         ctx.http.clone(),
     );

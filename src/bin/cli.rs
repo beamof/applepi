@@ -6,7 +6,7 @@ use applepi::agent::{Agent, AgentEvent};
 use applepi::config;
 use applepi::mcp;
 use applepi::memory::long_term::LongTermMemory;
-use applepi::tools::{default_tools, Tool};
+use applepi::tools::{default_tools, write_memory_tool, Tool};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
@@ -20,12 +20,6 @@ async fn main() -> anyhow::Result<()> {
     let mut persona = config::load_persona("AGENTS.md")?;
     persona.push_str(&config::load_skills_summary("skills"));
 
-    let long_term = if cfg.memory.enabled {
-        Some(LongTermMemory::open(&cfg.memory.db_path)?)
-    } else {
-        None
-    };
-
     // 合并默认工具 + MCP 远端工具
     let mut tools = default_tools();
     tools.extend(mcp::load_mcp_tools(&cfg.mcp_servers).await?);
@@ -34,6 +28,16 @@ async fn main() -> anyhow::Result<()> {
         let t = Arc::new(applepi::tools::shell::ShellTool::new(&cfg.shell));
         tools.insert(t.name().to_string(), t);
     }
+
+    // 长期记忆库：open 一次，Arc 共享给 Agent 与 write_memory 工具。
+    let long_term = if cfg.memory.enabled {
+        let arc = Arc::new(LongTermMemory::open(&cfg.memory.db_path)?);
+        let t = write_memory_tool(arc.clone());
+        tools.insert(t.name().to_string(), t);
+        Some(arc)
+    } else {
+        None
+    };
 
     let mut agent = Agent::new(
         cfg.llm_config(api_key),

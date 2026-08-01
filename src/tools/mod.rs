@@ -1,6 +1,7 @@
 pub mod cron;
 pub mod echo;
 pub mod fs;
+pub mod memory;
 pub mod shell;
 pub mod skill;
 // pub mod search; // 联网搜索工具示例：取消注释并在 default_tools 中注册
@@ -10,6 +11,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::memory::long_term::LongTermMemory;
 
 /// 工具接口：实现它即获得被 Agent 调用的能力。
 #[async_trait]
@@ -36,4 +39,10 @@ pub fn default_tools() -> ToolMap {
         .into_iter()
         .map(|t| (t.name().to_string(), t))
         .collect()
+}
+
+/// 写入长期记忆的工具：需要共享的长期记忆库实例。
+/// `long_term` 为 None（记忆未启用）时不注入，避免 agent 调用空写。
+pub fn write_memory_tool(long_term: Arc<LongTermMemory>) -> Arc<dyn Tool> {
+    Arc::new(memory::WriteMemoryTool::new(long_term))
 }

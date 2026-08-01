@@ -1,14 +1,37 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-use crate::llm::{build_tools_schema, chat_stream, Delta, LlmConfig, Message, ToolCall};
+use crate::llm::{build_tools_schema, chat, chat_stream, Delta, LlmConfig, Message, ToolCall};
 use crate::memory::long_term::LongTermMemory;
 use crate::memory::short_term::History;
 use crate::tools::ToolMap;
 
 pub const MAX_TURNS: usize = 64;
+
+/// 记忆抽取的 system prompt。
+///
+/// 目标：从一轮对话（用户输入 + 助手答复）里抽出值得**长期**记住的信息，
+/// 跳过寒暄、一次性指令、琐碎细节。输出 JSON 数组（每条是一句可独立理解的陈述），
+/// 无值得记的内容时输出 `[]`。
+///
+/// 选 JSON 数组而非自由文本：便于 `serde_json::from_str` 解析，解析失败兜底跳过
+/// （绝不写入垃圾到记忆库）。
+const EXTRACT_PROMPT: &str = "\
+你是一个记忆抽取器。分析下面这轮对话（用户输入 + 助手答复），提取值得长期记住的信息。\n\
+\n\
+值得记的：\n\
+- 用户偏好、习惯、个人背景（如「用户偏好 Rust」「用户在用 applepi 项目」）\n\
+- 重要事实、约定、决策结论（如「项目部署在 example.com」）\n\
+- 任务的关键结果（如「已把搜索换成 FTS5」）\n\
+\n\
+不要记的：寒暄、一次性指令、过程性琐碎细节、常识、本次对话中已显而易见的临时信息。\n\
+\n\
+输出格式：严格的 JSON 字符串数组，每条是一个可独立理解、带主语的陈述句。\
+不要输出数组以外的任何文字（不要 markdown 围栏、不要解释）。\n\
+示例：[\"用户喜欢用 Rust 写后端\", \"用户的项目 applepi 部署在 example.com\"]\n\
+无值得记的内容时输出：[]";
 
 /// 判断一条 agent 回复是否标记为静默（不应推送给用户）。
 /// agent 在回复开头或结尾加 `[SILENT]` 即触发，调用方据此跳过发送。
@@ -17,13 +40,90 @@ pub fn is_silent(s: &str) -> bool {
     t.starts_with("[SILENT]") || t.ends_with("[SILENT]")
 }
 
+/// 解析记忆抽取 LLM 的输出，返回有效记忆条目列表。
+///
+/// 期望格式：JSON 字符串数组，如 `["用户偏好 Rust", "项目部署在 example.com"]`。
+/// 容错：模型偶尔会在数组外加 markdown 围栏（```json ... ```）或前后噪声文字，
+/// 这里取**首个 `[` 到末个 `]`** 的子串再解析，兼容这种情况。
+///
+/// 解析失败、非数组、含非字符串元素、或全部为空白条目时返回空 Vec
+/// （调用方据此跳过写入，绝不污染记忆库）。
+pub fn parse_extract_output(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    // 提取首个 [ 到末个 ] 的子串，兼容前后噪声 / 围栏
+    let slice = match (trimmed.find('['), trimmed.rfind(']')) {
+        (Some(start), Some(end)) if start < end => &trimmed[start..=end],
+        _ => return Vec::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(slice) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match parsed.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_extract_output;
+
+    #[test]
+    fn parse_plain_array() {
+        let out = parse_extract_output(r#"["用户偏好 Rust", "项目部署在 example.com"]"#);
+        assert_eq!(out, vec!["用户偏好 Rust", "项目部署在 example.com"]);
+    }
+
+    #[test]
+    fn parse_empty_array() {
+        let out = parse_extract_output("[]");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_with_markdown_fence() {
+        let raw = "```json\n[\"条目一\", \"条目二\"]\n```";
+        let out = parse_extract_output(raw);
+        assert_eq!(out, vec!["条目一", "条目二"]);
+    }
+
+    #[test]
+    fn parse_with_leading_trailing_noise() {
+        // 模型偶尔会在数组前后加解释文字
+        let raw = "好的，这是抽取结果：[\"a\",\"b\"]\n以上。";
+        let out = parse_extract_output(raw);
+        assert_eq!(out, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_invalid_returns_empty() {
+        // 非 JSON / 不是数组 / 缺括号 —— 全部返回空，绝不 panic
+        assert!(parse_extract_output("not json at all").is_empty());
+        assert!(parse_extract_output("{\"key\": \"value\"}").is_empty());
+        assert!(parse_extract_output("[unclosed").is_empty());
+    }
+
+    #[test]
+    fn parse_skips_blank_and_non_string() {
+        // 混合类型 / 空白条目：只保留有效非空字符串
+        let raw = r#"["有效", "", 123, "  ", "也有效"]"#;
+        let out = parse_extract_output(raw);
+        assert_eq!(out, vec!["有效", "也有效"]);
+    }
+}
+
 /// Agent 主入口：持有配置、工具、记忆。
 pub struct Agent {
     pub(crate) cfg: LlmConfig,
     pub(crate) tools: ToolMap,
     pub(crate) http: Client,
     pub(crate) history: History,
-    pub(crate) long_term: Option<LongTermMemory>,
+    pub(crate) long_term: Option<Arc<LongTermMemory>>,
     pub(crate) top_k: usize,
     /// 最近一次用户输入，供续跑成功后写入长期记忆用。
     pub(crate) last_input: Option<String>,
@@ -91,7 +191,7 @@ impl Agent {
         cfg: LlmConfig,
         persona: String,
         tools: ToolMap,
-        long_term: Option<LongTermMemory>,
+        long_term: Option<Arc<LongTermMemory>>,
         top_k: usize,
         http: Client,
     ) -> Self {
@@ -237,10 +337,10 @@ impl Agent {
                 },
                 ..Default::default()
             });
-            events.push(AgentEvent::Final(text_buf));
-            // 异步存记忆（不阻塞返回）
+            events.push(AgentEvent::Final(text_buf.clone()));
+            // 异步抽取长期记忆（spawn 后立即返回，不阻塞）
             if let Some(input) = self.last_input.as_deref() {
-                self.maybe_remember(input).await;
+                self.maybe_remember(input, &text_buf);
             }
             return Ok(events);
         }
@@ -288,11 +388,59 @@ impl Agent {
         }
     }
 
-    async fn maybe_remember(&self, input: &str) {
-        if let Some(mem) = self.long_term.as_ref() {
-            // 简单策略：直接存用户原话。生产中可让 LLM 抽取要点。
-            let _ = mem.remember(input).await;
+    /// 异步抽取长期记忆：spawn 一个独立任务，从本轮对话（input + reply）
+    /// 让 LLM 抽取值得长期记住的信息，批量写入记忆库。
+    ///
+    /// 设计要点：
+    /// - **异步**：spawn 后立即返回，不阻塞对话主流程。代价是进程崩溃时这一轮
+    ///   记忆会丢（可接受，下一轮还会触发，且 write_memory 工具可补）。
+    /// - **轻量过滤**：spawn 前同步跳过明显不值得抽取的对话（过短 / 斜杠命令 /
+    ///   空答复），省一次 LLM 调用。
+    /// - **失败静默**：抽取 / 解析 / 写入任一步失败都只 `tracing::warn`，
+    ///   绝不影响对话；解析失败宁可跳过也不写脏数据。
+    /// - **共享实例**：所有 move 进任务的字段都是 Clone 便宜的（cfg / http /
+    ///   Arc<LongTermMemory>），任务独立运行不借用 &mut self。
+    fn maybe_remember(&self, input: &str, reply: &str) {
+        let mem = match self.long_term.clone() {
+            Some(m) => m,
+            None => return, // 记忆未启用
+        };
+
+        // 轻量过滤：不值得抽取的对话直接跳过，省一次 LLM 调用
+        let input_t = input.trim();
+        if input_t.len() < 8 || input_t.starts_with('/') || reply.trim().is_empty() {
+            return;
         }
+
+        let cfg = self.cfg.clone();
+        let http = self.http.clone();
+        let input = input.to_string();
+        let reply = reply.to_string();
+        tokio::spawn(async move {
+            let user_msg = format!(
+                "用户输入：\n{input}\n\n助手答复：\n{reply}\n\n请抽取值得长期记住的信息。"
+            );
+            let messages = vec![
+                Message::system(EXTRACT_PROMPT),
+                Message::user(user_msg),
+            ];
+            let raw = match chat(cfg, messages, http).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("记忆抽取 LLM 调用失败（已跳过）: {e}");
+                    return;
+                }
+            };
+            let items = parse_extract_output(&raw);
+            if items.is_empty() {
+                tracing::debug!("记忆抽取：本轮无可记内容");
+                return;
+            }
+            match mem.remember_batch(&items).await {
+                Ok(_) => tracing::info!("记忆抽取：写入 {} 条", items.len()),
+                Err(e) => tracing::warn!("记忆抽取写入失败（已跳过）: {e}"),
+            }
+        });
     }
 
     async fn dispatch(&self, call: &ToolCall) -> Result<String> {

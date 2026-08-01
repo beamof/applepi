@@ -4,7 +4,7 @@
 
 - **对话**：基于 OpenAI 兼容接口，一套代码接 GPT / DeepSeek / 智谱 / 本地 Ollama
 - **行动**：可插拔工具机制（Function Calling），自带文件读取等示例工具
-- **记忆**：短期会话上下文 + 长期向量记忆（SQLite，零运维）
+- **记忆**：短期会话上下文 + 长期 FTS5 全文记忆（SQLite，零运维；agent 可主动写入）
 - **流式**：SSE 增量输出，终端逐字、Telegram 增量编辑
 - **接入**：CLI 与 Telegram Bot 两个入口，共享同一套核心
 
@@ -40,7 +40,7 @@ memory:
 
 长期记忆用 **SQLite FTS5** 全文检索 + BM25 评分。零 ML 模型、零网络、零 API 依赖，部署即用。rusqlite 的 `bundled` feature 默认启用 FTS5，无需额外编译。
 
-- **写入**：每条记忆的文本存入 FTS5 虚拟表，自动建倒排索引。
+- **写入**：两条路径——① agent 每轮自动存用户原话（兜底）；② agent 通过 `write_memory` 工具主动写入（记住偏好、事实、约定等需要长期保留的内容）。文本存入 FTS5 虚拟表，自动建倒排索引。
 - **检索**：用户消息作为 query，BM25 评分排序取 Top-K 注入 prompt。
 - **中文分词**：FTS5 内置 `unicode61` 分词器对中文按字切分（"苹果派"→"苹/果/派"），短句关键词检索够用；缺点是无语义相似（"水果"匹配不到"苹果"），但记忆场景以关键词命中为主，影响可接受。
 - **查询安全**：用户输入按字切分后每个字符用 `"..."` 短语引用转义，规避 FTS5 MATCH 操作符注入。
@@ -96,6 +96,21 @@ cargo build --release --bins
 | 智谱 | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
 | 本地 Ollama | `http://localhost:11434/v1` | `qwen2.5` |
 
+### 接口协议（自动探测，无需配置）
+
+applepi **默认优先尝试** OpenAI 较新的 `/v1/responses` 接口；若端点不支持（返回 404/400/405），**自动回退**到经典的 `/v1/chat/completions` 并记住结论，后续请求直接走已确认可用的协议，不再重复探测。
+
+| 接口 | endpoint | 说明 |
+|---|---|---|
+| Responses（默认优先） | `/v1/responses` | OpenAI 原生、部分新模型（如 GPT-5 系列 / 部分 reasoning 模型）仅提供此接口 |
+| Chat Completions（自动回退） | `/v1/chat/completions` | OpenAI 兼容生态通用（DeepSeek / 智谱 / Ollama 等，多数不支持 Responses） |
+
+无需任何配置——换厂商时只改 `api_base` / `model`，首条消息自动探测出可用协议。两套协议共用同一套 `Agent` / 工具 / 流式事件抽象（`Delta`），调用方完全无感。
+
+> 实现差异：Responses 用 `input`（含 `function_call` / `function_call_output` item）替代 `messages`，
+> SSE 改为命名事件（`response.output_text.delta` / `response.function_call_arguments.delta` / `response.completed` 等），
+> 内部已做转换。回退判定只针对「接口/模型不存在」类状态码（404/400/405）；鉴权（401）、限流（429）、服务端错误（5xx）不触发回退。
+
 ---
 
 ## 项目结构
@@ -110,7 +125,7 @@ applepi/
     ├── lib.rs              # 模块入口
     ├── main → 拆为 bin/    # 两个可执行入口
     ├── agent.rs            # ★ ReAct 主循环 + 记忆注入 + 事件流
-    ├── llm.rs              # OpenAI 兼容客户端（流式 + 非流式）
+    ├── llm.rs              # OpenAI 兼容客户端（Chat Completions + Responses 双协议，流式 + 非流式）
     ├── config.rs           # YAML 配置加载
     ├── bot.rs              # Telegram 长轮询 + 流式编辑
     ├── memory/
@@ -128,6 +143,7 @@ applepi/
     │   ├── cron.rs         # cron 管理工具（agent 调用）
     │   ├── echo.rs         # 示例工具
     │   ├── fs.rs           # read_file 工具
+    │   ├── memory.rs       # write_memory 工具（agent 主动写入长期记忆）
     │   ├── shell.rs        # shell 命令工具（白名单/黑名单）
     │   └── skill.rs        # 技能创建/运行工具
     └── bin/

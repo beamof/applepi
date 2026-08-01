@@ -266,6 +266,7 @@ impl Config {
             api_key,
             model: self.llm.model.clone(),
             prompt_cache_control: self.llm.prompt_cache_control,
+            fallback: crate::llm::new_fallback(),
         }
     }
 }

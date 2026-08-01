@@ -52,6 +52,8 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
 
     // 启动期后台预热：发一个最小请求到 LLM endpoint，触发 TLS 握手 + HTTP/2
     // 连接建立，把首次真实对话的握手成本前移到启动期。失败静默，不影响启动。
+    // 只做连接预热（不探测协议）：Chat Completions 路径是所有 OpenAI 兼容端点的
+    // 公共子集，足以建立连接池；协议探测由首次真实请求的回退逻辑处理。
     {
         let warmup_http = http.clone();
         let warmup_cfg = llm_cfg.clone();
@@ -120,15 +122,36 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
     }
     let top_k = cfg.memory.top_k_or(3);
 
+    // 长期记忆库：启动时 open 一次，Arc 共享给所有 actor 与 write_memory 工具。
+    // 旧实现是每个 actor 各 open 一次——改为共享一份更省资源（一个 SQLite 连接），
+    // 且 WAL 模式天然支持并发读写。
+    let long_term: Option<Arc<crate::memory::long_term::LongTermMemory>> = if cfg.memory.enabled {
+        match crate::memory::long_term::LongTermMemory::open(&cfg.memory.db_path) {
+            Ok(m) => {
+                let arc = Arc::new(m);
+                // 注入写记忆工具，让 agent 可主动写入长期记忆
+                let t = crate::tools::write_memory_tool(arc.clone());
+                tools.insert(t.name().to_string(), t);
+                Some(arc)
+            }
+            Err(e) => {
+                tracing::error!("长期记忆库打开失败，记忆功能未启用: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 构建新 actor 所需的共享上下文（Clone 便宜：全是 Arc）
     let ctx = Arc::new(ChatCtx {
         llm_cfg,
         persona,
         tools,
-        cfg: cfg.clone(),
         top_k,
         http: http.clone(),
         base: base.clone(),
+        long_term,
     });
 
     // 每个 chat_id 一个独立 actor task（拥有自己的 Agent，互不阻塞）。
@@ -235,10 +258,11 @@ struct ChatCtx {
     llm_cfg: crate::llm::LlmConfig,
     persona: String,
     tools: crate::tools::ToolMap,
-    cfg: Config,
     top_k: usize,
     http: Client,
     base: String,
+    /// 共享长期记忆库（启动时 open 一次）。记忆未启用时为 None。
+    long_term: Option<Arc<crate::memory::long_term::LongTermMemory>>,
 }
 
 /// 主循环持有的 actor 句柄。Clone = 共享同一个 actor。
@@ -263,16 +287,12 @@ struct ChatActor {
 impl ChatActor {
     fn spawn(chat_id: i64, ctx: Arc<ChatCtx>) -> ChatHandle {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
-        let lt = if ctx.cfg.memory.enabled {
-            crate::memory::long_term::LongTermMemory::open(&ctx.cfg.memory.db_path).ok()
-        } else {
-            None
-        };
+        // 复用启动时 open 的共享记忆库实例，而非每 actor 各 open 一次。
         let agent = Agent::new(
             ctx.llm_cfg.clone(),
             ctx.persona.clone(),
             ctx.tools.clone(),
-            lt,
+            ctx.long_term.clone(),
             ctx.top_k,
             ctx.http.clone(),
         );

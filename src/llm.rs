@@ -54,6 +54,36 @@ pub fn build_http_client() -> Result<Client> {
         .build()?)
 }
 
+/// 拉取接口支持的模型列表（OpenAI 兼容的 GET /models）。
+///
+/// 返回去重、按字典序排序后的模型 id，用于 /model 命令向用户展示可切换的模型。
+/// 端点不支持或请求失败时返回 Err（由调用方反馈给用户，不影响会话）。
+pub async fn list_models(cfg: &LlmConfig, client: &Client) -> Result<Vec<String>> {
+    let resp = client
+        .get(format!("{}/models", cfg.api_base))
+        .bearer_auth(&cfg.api_key)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("获取模型列表失败 [{status}]: {text}"));
+    }
+    let v: Value = resp.json().await?;
+    let mut ids: Vec<String> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,

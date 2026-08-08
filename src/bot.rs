@@ -218,6 +218,7 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                     "help" | "start" => {
                         let help = "<b>命令</b>\n\
 /new · /clear — 开启新会话，清空当前上下文\n\
+/model — 查看 / 切换当前 LLM 模型\n\
 /help — 显示本帮助\n\n\
 直接发消息即可对话。长期记忆跨会话保留。";
                         let _ = http
@@ -225,6 +226,16 @@ pub async fn run(cfg: Config, api_key: String) -> Result<()> {
                             .json(&json!({ "chat_id": chat_id, "text": help, "parse_mode": "HTML" }))
                             .send()
                             .await;
+                    }
+                    "model" => {
+                        // 转发到 actor：选择过程是多轮交互，需要 actor 维护待选列表
+                        let handle = {
+                            let mut map = actors.lock().await;
+                            map.entry(chat_id)
+                                .or_insert_with(|| ChatActor::spawn(chat_id, ctx.clone()))
+                                .clone()
+                        };
+                        let _ = handle.tx.try_send(text);
                     }
                     _ => {
                         let reply = format!("未知命令 /{cmd_name}。发送 /help 查看可用命令。");
@@ -272,7 +283,7 @@ struct ChatHandle {
     _task: Arc<tokio::task::JoinHandle<()>>,
 }
 
-/// actor 内部状态：一个 Agent + 续跑/超时交互的挂起状态。
+/// actor 内部状态：一个 Agent + 续跑/超时/模型选择交互的挂起状态。
 struct ChatActor {
     chat_id: i64,
     agent: Agent,
@@ -282,6 +293,9 @@ struct ChatActor {
     pending_continue: Option<i64>,
     /// 超时询问：等用户回复 "1"(继续) / "2"(终止)
     pending_timeout: Option<i64>,
+    /// /model 命令的待选模型列表；用户回复序号或模型名后据此切换。
+    /// Some 表示正处于选择态（下一条非 /model 消息视为选择）。
+    pending_model_pick: Option<Vec<String>>,
 }
 
 impl ChatActor {
@@ -303,6 +317,7 @@ impl ChatActor {
             base: ctx.base.clone(),
             pending_continue: None,
             pending_timeout: None,
+            pending_model_pick: None,
         };
         let task = tokio::spawn(async move {
             while let Some(text) = rx.recv().await {
@@ -344,9 +359,92 @@ impl ChatActor {
             // 非肯定词 → 放弃续跑，按新输入处理
         }
 
-        // 3) 正常新输入：发占位消息后处理
+        // 3) /model 模型选择待回应（非 /model 开头才视为选择，否则视为重开选择）
+        if let Some(models) = self.pending_model_pick.take() {
+            if !text.trim().starts_with('/') {
+                if let Some(reply) = self.try_pick_model(&text, &models).await {
+                    self.send_text(&reply).await;
+                    return;
+                }
+                // 无法识别的选择：恢复挂起态并重新展示，等用户再回复
+                self.pending_model_pick = Some(models.clone());
+                let reply = format!(
+                    "⚠️ 无法识别「{}」，请回复序号（如 1）或完整模型名。\n\n{}",
+                    text.trim(),
+                    format_model_list(&models, &self.agent.cfg.model)
+                );
+                self.send_text(&reply).await;
+                return;
+            }
+            // 落到此分支：用户发了新的 / 命令 → 放弃选择，继续往下按命令处理
+        }
+
+        // 4) /model 命令：拉取模型列表并让用户选择（异步，不阻塞 actor）
+        if text.trim() == "/model" {
+            self.show_model_picker().await;
+            return;
+        }
+
+        // 5) 正常新输入：发占位消息后处理
         let msg_id = send_placeholder(&self.http, &self.base, self.chat_id).await;
         self.process(msg_id, Some(&text)).await;
+    }
+
+    /// 执行 /model 命令：拉取 LLM 支持的模型列表，展示给用户选择。
+    /// 先发一条「正在获取…」占位，列表到达后替换为编号清单；拉取失败则提示错误。
+    ///
+    /// 同步 await（actor 单线程串行处理，拉取期间该 chat 不响应新消息——与一次
+    /// 正常 LLM 对话同等代价，可接受）。拉取成功后设置 `pending_model_pick` 进入选择态。
+    async fn show_model_picker(&mut self) {
+        let placeholder = self.send_text("⏳ 正在获取可用模型列表…").await;
+        let cfg = self.agent.cfg.clone();
+        let models = match crate::llm::list_models(&cfg, &self.http).await {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => {
+                edit_or_send(&self.http, &self.base, self.chat_id, placeholder, None)
+                    .await;
+                let _ = self.send_text("⚠️ 接口返回的模型列表为空，无法切换。").await;
+                return;
+            }
+            Err(e) => {
+                edit_or_send(&self.http, &self.base, self.chat_id, placeholder, None)
+                    .await;
+                let _ = self
+                    .send_text(&format!("⚠️ 获取模型列表失败：{e}"))
+                    .await;
+                return;
+            }
+        };
+        let reply = format_model_list(&models, &self.agent.cfg.model);
+        let _ = edit_or_send(&self.http, &self.base, self.chat_id, placeholder, Some(&reply)).await;
+        self.pending_model_pick = Some(models);
+    }
+
+    /// 尝试按用户输入（序号或模型名）从候选列表切换模型。
+    /// 命中则更新 `agent.cfg.model` 并返回成功提示；未命中返回 None（由调用方决定如何提示）。
+    async fn try_pick_model(&mut self, input: &str, models: &[String]) -> Option<String> {
+        let picked = pick_model(input, models)?;
+        if picked == self.agent.cfg.model {
+            return Some(format!("当前已是「{picked}」，无需切换。"));
+        }
+        let old = std::mem::replace(&mut self.agent.cfg.model, picked.clone());
+        tracing::info!("chat {} 切换模型: {} -> {}", self.chat_id, old, picked);
+        Some(format!("✅ 模型已切换：\n{old}\n→ <b>{picked}</b>"))
+    }
+
+    /// 发送一条普通文本消息（HTML），返回其 message_id。失败返回 None。
+    async fn send_text(&self, text: &str) -> Option<i64> {
+        let resp = self
+            .http
+            .post(format!("{}/sendMessage", self.base))
+            .json(&json!({ "chat_id": self.chat_id, "text": text, "parse_mode": "HTML" }))
+            .send()
+            .await
+            .ok()?;
+        let v: serde_json::Value = resp.json().await.ok()?;
+        v.get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|m| m.as_i64())
     }
 
     /// 执行一次 agent 处理，带超时保护。
@@ -857,10 +955,156 @@ async fn render_events(
     (buf, pending)
 }
 
+/// 把模型列表渲染成带序号的 HTML 清单（当前在用模型标注 ✅），供 /model 命令展示。
+/// Telegram 消息上限 4096 字符，列表过长时尾部截断（极少数接口会返回超长列表）。
+fn format_model_list(models: &[String], current: &str) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(models.len() + 1);
+    lines.push("<b>可用模型</b>（回复序号或模型名切换，如 <code>1</code>）".into());
+    for (i, m) in models.iter().enumerate() {
+        let mark = if m == current { " ✅" } else { "" };
+        lines.push(format!("{}. <code>{}</code>{}", i + 1, html_escape(m), mark));
+    }
+    let mut out = lines.join("\n");
+    if out.chars().count() > 4000 {
+        out = out.chars().take(4000).collect();
+    }
+    out
+}
+
+/// 把字符串做 Telegram 所需的最小 HTML 转义（& < >）。
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 解析用户对模型清单的选择：支持「序号」（1-based，支持 `1.` / `1、` 等尾缀）
+/// 或「完整模型名」（精确匹配候选列表中的某一项）。
+/// 命中返回所选模型名（克隆自候选列表），未命中返回 None。
+fn pick_model(input: &str, models: &[String]) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 1) 序号：剥离两侧常见标点/括号后按数字解析（兼容 "2." "2、" "(2)" "1、" 等）
+    let bracket = ['.', '、', '。', ')', '）', '(', '（', ':', '：'];
+    let cleaned = trimmed.trim().trim_matches(&bracket[..]).trim();
+    if let Ok(n) = cleaned.parse::<usize>() {
+        if n >= 1 && n <= models.len() {
+            return Some(models[n - 1].clone());
+        }
+        return None; // 纯数字但越界 → 不再尝试按名匹配
+    }
+    // 2) 模型名：精确匹配（大小写敏感，模型名通常区分大小写）
+    let hit = models.iter().find(|m| m.as_str() == trimmed)?;
+    Some(hit.clone())
+}
+
+/// 编辑已知消息文本；msg_id 为 None 时改为新发一条。
+/// 用于 /model 的「先占位、列表到达后替换」交互。
+async fn edit_or_send(
+    http: &Client,
+    base: &str,
+    chat_id: i64,
+    msg_id: Option<i64>,
+    text: Option<&str>,
+) -> Option<i64> {
+    let Some(id) = msg_id else {
+        // 无占位 message_id：直接发新消息
+        if let Some(t) = text {
+            return send_plain(http, base, chat_id, t).await;
+        }
+        return None;
+    };
+    match text {
+        Some(t) => {
+            edit_text(http, base, chat_id, Some(id), t).await;
+            Some(id)
+        }
+        None => {
+            // text=None 表示删掉占位（拉取失败的兜底）
+            delete_message(http, base, chat_id, Some(id)).await;
+            None
+        }
+    }
+}
+
+/// 发送一条纯文本消息（不带 parse_mode），返回其 message_id。
+async fn send_plain(http: &Client, base: &str, chat_id: i64, text: &str) -> Option<i64> {
+    let resp = http
+        .post(format!("{base}/sendMessage"))
+        .json(&json!({ "chat_id": chat_id, "text": text }))
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = resp.json().await.ok()?;
+    v.get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|m| m.as_i64())
+}
+
 /// 判断用户回复是否为肯定（继续/继续吧/continue/yes/y/是/好的/1，忽略大小写与空白）。
 fn is_affirmative(s: &str) -> bool {
     matches!(
         s.trim().to_ascii_lowercase().as_str(),
         "继续" | "继续吧" | "是" | "好" | "好的" | "ok" | "continue" | "yes" | "y" | "1"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_model;
+
+    fn sample_models() -> Vec<String> {
+        vec![
+            "gpt-4o".to_string(),
+            "gpt-4o-mini".to_string(),
+            "o1".to_string(),
+        ]
+    }
+
+    #[test]
+    fn pick_by_one_based_index() {
+        let m = sample_models();
+        assert_eq!(pick_model("1", &m).as_deref(), Some("gpt-4o"));
+        assert_eq!(pick_model("2", &m).as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(pick_model(" 3 ", &m).as_deref(), Some("o1"));
+    }
+
+    #[test]
+    fn pick_strips_common_trailing_punctuation() {
+        let m = sample_models();
+        assert_eq!(pick_model("2.", &m).as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(pick_model("2、", &m).as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(pick_model("(2)", &m).as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn pick_by_exact_model_name() {
+        let m = sample_models();
+        assert_eq!(pick_model("o1", &m).as_deref(), Some("o1"));
+        assert_eq!(pick_model(" gpt-4o ", &m).as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn pick_rejects_out_of_range_index() {
+        let m = sample_models();
+        assert!(pick_model("0", &m).is_none());
+        assert!(pick_model("4", &m).is_none());
+    }
+
+    #[test]
+    fn pick_rejects_unknown_name_and_garbage() {
+        let m = sample_models();
+        assert!(pick_model("gpt-3.5", &m).is_none());
+        assert!(pick_model("hello", &m).is_none());
+        assert!(pick_model("", &m).is_none());
+    }
+
+    #[test]
+    fn pick_is_case_sensitive_for_names() {
+        // 模型 id 通常区分大小写：O1 ≠ o1
+        let m = sample_models();
+        assert!(pick_model("O1", &m).is_none());
+    }
 }
